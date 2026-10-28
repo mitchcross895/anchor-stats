@@ -404,32 +404,36 @@ function render() {
     }
   }
 
-  // players
+  // players: sized in map units, so they keep their size relative to the map at any zoom
+  // (u = 1 at the "Focus fight" zoom; names stay readable at every zoom)
+  const u = view.s / PLAYER_SCALE, font = Math.max(9, Math.min(15, 11 * u));
   for (const [pid, p] of pos) {
     const pl = R.players[pid], isA = pid === R.anchor_id;
     const col = pl.team === 'CT' ? C.ct : C.t;
-    const x = sx(p.x), y = sy(p.y), r = isA ? 8 : 6;
+    const x = sx(p.x), y = sy(p.y), r = (isA ? 8 : 6) * u;
     const a = p.yaw * Math.PI / 180;
     ctx.globalAlpha = (pl.local || isA ? 1 : 0.45) * (onShown(p) ? 1 : 0.35);
     // where they're looking: a faint view cone and a line down the middle
-    const cone = r + 46, half = 0.5;
+    const cone = r + 46 * u, half = 0.5;
     ctx.fillStyle = col; ctx.globalAlpha *= 0.18;
     ctx.beginPath(); ctx.moveTo(x, y); ctx.arc(x, y, cone, -a - half, -a + half); ctx.closePath(); ctx.fill();
     ctx.globalAlpha /= 0.18;
-    ctx.strokeStyle = col; ctx.lineWidth = 4.5; ctx.lineCap = 'round';
-    ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + Math.cos(a) * (r + 11), y - Math.sin(a) * (r + 11)); ctx.stroke();
+    ctx.strokeStyle = col; ctx.lineWidth = 4.5 * u; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + Math.cos(a) * (r + 11 * u), y - Math.sin(a) * (r + 11 * u)); ctx.stroke();
     ctx.lineCap = 'butt';
     ctx.fillStyle = col; ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
-    if (isA) { ctx.strokeStyle = C.anchor; ctx.lineWidth = 2.5; ctx.beginPath(); ctx.arc(x, y, r + 3, 0, Math.PI * 2); ctx.stroke(); }
+    if (isA) { ctx.strokeStyle = C.anchor; ctx.lineWidth = 2.5 * u; ctx.beginPath(); ctx.arc(x, y, r + 3 * u, 0, Math.PI * 2); ctx.stroke(); }
     // health bar
-    ctx.fillStyle = 'rgba(0,0,0,.6)'; ctx.fillRect(x - 10, y + r + 4, 20, 3);
-    ctx.fillStyle = p.hp > 50 ? C.good : p.hp > 20 ? C.contact : C.bad; ctx.fillRect(x - 10, y + r + 4, 20 * Math.max(0, p.hp) / 100, 3);
+    const bw = 20 * u, by = y + r + 4 * u;
+    ctx.fillStyle = 'rgba(0,0,0,.6)'; ctx.fillRect(x - bw / 2, by, bw, 3 * u);
+    ctx.fillStyle = p.hp > 50 ? C.good : p.hp > 20 ? C.contact : C.bad; ctx.fillRect(x - bw / 2, by, bw * Math.max(0, p.hp) / 100, 3 * u);
     // name
-    ctx.fillStyle = isA ? C.anchor : C.text; ctx.font = (isA ? '700 ' : '500 ') + '11px system-ui'; ctx.textAlign = 'left';
-    ctx.fillText(shortName(pl.name), x + r + 5, y - r);
+    ctx.fillStyle = isA ? C.anchor : C.text; ctx.font = (isA ? '700 ' : '500 ') + font + 'px system-ui'; ctx.textAlign = 'left';
+    ctx.fillText(shortName(pl.name), x + r + 5 * u, y - r);
     ctx.globalAlpha = 1;
   }
 }
+const PLAYER_SCALE = 0.22;  // screen pixels per map unit at which players are drawn at their base size
 const shortName = n => n.includes('|') ? n.split('|').pop().trim() : n;
 
 // grenades: a trail while in the air, then the effect where it landed
