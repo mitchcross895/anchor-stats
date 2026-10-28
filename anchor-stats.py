@@ -2,6 +2,7 @@
 anchor-stats.py - Rate CS2 site anchors from a .dem file.
 
 Usage:
+    python anchor-stats.py                # every .dem in demos/ -> output/<demo name>/
     python anchor-stats.py match.dem
     python anchor-stats.py match.dem --player "s1mple" --csv anchors.csv
     python anchor-stats.py match.dem --extra-places "BombsiteB:Bench,Market"
@@ -115,7 +116,7 @@ def get_rounds(parser):
     ends = event_df(parser, "round_end")
     start = event_df(parser, "round_announce_match_start")
     if freeze.empty:
-        sys.exit("No round_freeze_end events found - is this a CS2 demo?")
+        raise ValueError("No round_freeze_end events found - is this a CS2 demo?")
 
     match_start = int(start["tick"].max()) if not start.empty else 0
     freeze_ticks = sorted(int(t) for t in freeze["tick"] if t >= match_start)
@@ -453,13 +454,45 @@ def summarise(eng):
     return summary.reset_index().drop(columns="steamid").sort_values("anchor_rating", ascending=False)
 
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+DEMOS_DIR = os.path.join(HERE, "demos")
+OUTPUT_DIR = os.path.join(HERE, "output")
+
+
+def batch(args, site_places):
+    """Process every .dem in demos/ into output/<demo name>/."""
+    demos = sorted(f for f in os.listdir(DEMOS_DIR) if f.lower().endswith(".dem")) if os.path.isdir(DEMOS_DIR) else []
+    if not demos:
+        sys.exit(f"No .dem files found. Put your demos in:\n  {DEMOS_DIR}")
+    done = 0
+    for f in demos:
+        stem = os.path.splitext(f)[0]
+        out_dir = os.path.join(OUTPUT_DIR, stem)
+        viewer = os.path.join(out_dir, "review.html")
+        if os.path.exists(viewer) and not args.force:
+            print(f"Skipping {f} (already done - use --force to redo)")
+            continue
+        print(f"\n### {f}  (parsing, this can take a minute)")
+        os.makedirs(out_dir, exist_ok=True)
+        try:
+            run(os.path.join(DEMOS_DIR, f), site_places, args.player,
+                out=os.path.join(out_dir, "ratings.txt"), viewer_path=viewer,
+                csv=os.path.join(out_dir, "engagements.csv"))
+            done += 1
+        except Exception as e:  # keep going so one bad demo doesn't stop the rest
+            print(f"Failed on {f}: {e}")
+    print(f"\nProcessed {done} demo(s). Results are in:\n  {OUTPUT_DIR}")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Rate CS2 site anchors from a .dem file.")
-    ap.add_argument("demo", help="path to the .dem file")
+    ap.add_argument("demo", nargs="?",
+                    help="path to the .dem file (leave out to process every demo in the demos/ folder)")
     ap.add_argument("--player", help="only show this player (name substring)")
     ap.add_argument("--csv", help="write every engagement to this CSV file")
     ap.add_argument("--out", help="also write the printed report to this text file")
     ap.add_argument("--viewer", help="write a 2D replay viewer of every engagement to this .html file")
+    ap.add_argument("--force", action="store_true", help="demos/ mode: redo demos that already have output")
     ap.add_argument("--extra-places", action="append", default=[],
                     help='treat extra nav place names as a site, e.g. "BombsiteB:Bench,Market"')
     args = ap.parse_args()
@@ -470,13 +503,23 @@ def main():
         site = site.replace("Bombsite", "").strip().upper()
         site_places.setdefault(site, set()).update(p.strip() for p in places.split(",") if p.strip())
 
-    map_name, eng, viewer = analyse(args.demo, site_places)
+    if args.demo is None:
+        batch(args, site_places)
+        return
+    try:
+        run(args.demo, site_places, args.player, args.out, args.viewer, args.csv)
+    except ValueError as e:
+        sys.exit(str(e))
+
+
+def run(demo, site_places, player=None, out=None, viewer_path=None, csv=None):
+    map_name, eng, viewer = analyse(demo, {k: set(v) for k, v in site_places.items()})
     if eng.empty:
-        sys.exit("No anchor engagements found. Try --extra-places if the map uses other place names.")
-    if args.player:
-        eng = eng[eng["player"].str.contains(args.player, case=False)]
+        raise ValueError("No anchor engagements found. Try --extra-places if the map uses other place names.")
+    if player:
+        eng = eng[eng["player"].str.contains(player, case=False)]
         if eng.empty:
-            sys.exit(f"No anchor engagements for '{args.player}'.")
+            raise ValueError(f"No anchor engagements for '{player}'.")
 
     cols = ["round", "player", "site", "situation", "contact", "kills", "assists",
             "damage", "survived", "time_held_s", "planted_here", "round_won", "score"]
@@ -492,18 +535,18 @@ def main():
     ])
     print("\n" + report)
 
-    if args.out:
-        with open(args.out, "w", encoding="utf-8") as f:
+    if out:
+        with open(out, "w", encoding="utf-8") as f:
             f.write(report + "\n")
-        print(f"\nWrote report to {args.out}")
+        print(f"\nWrote report to {out}")
 
-    if args.viewer:
-        write_viewer(args.viewer, viewer, eng, summary)
-        print(f"\nWrote 2D review viewer to {args.viewer} - open it in a browser")
+    if viewer_path:
+        write_viewer(viewer_path, viewer, eng, summary)
+        print(f"\nWrote 2D review viewer to {viewer_path} - open it in a browser")
 
-    if args.csv:
-        eng.to_csv(args.csv, index=False)
-        print(f"\nWrote {len(eng)} engagements to {args.csv}")
+    if csv:
+        eng.to_csv(csv, index=False)
+        print(f"\nWrote {len(eng)} engagements to {csv}")
 
 
 if __name__ == "__main__":

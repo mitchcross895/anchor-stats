@@ -1,0 +1,2 @@
+demoparser2>=0.42
+pandas>=2.0

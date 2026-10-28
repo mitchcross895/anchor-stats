@@ -1,0 +1,2 @@
+Put your CS2 .dem files in this folder, then run run.bat (Windows) or run.sh (Mac/Linux).
+Each demo gets its own folder in ../output with review.html, ratings.txt and engagements.csv.
