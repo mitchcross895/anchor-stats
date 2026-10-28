@@ -82,6 +82,32 @@
   .feed li:hover { background: var(--panel-2); }
   .feed .tm { font-variant-numeric: tabular-nums; min-width: 44px; }
 
+  .lib { padding: 0 16px 4px; display: flex; flex-direction: column; gap: 8px; }
+  .lib[hidden] { display: none; }
+  .lib .pick { display: flex; gap: 6px; }
+  .lib select { flex: 1; min-width: 0; background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; }
+  .btn { background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 5px 10px; cursor: pointer; }
+  .btn:hover { border-color: var(--accent); }
+  a.btn { color: inherit; text-decoration: none; text-align: center; font-size: 12.5px; }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--bg); font-weight: 600; }
+  .jobs { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; font-size: 12.5px; }
+  .jobs li { background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
+  .jobs .nm { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .jobs .st { color: var(--muted); display: flex; justify-content: space-between; gap: 8px; }
+  .jobs li.err { border-color: var(--bad); }
+  .jobs li.err .st { color: var(--bad); }
+  .jobs .x { background: none; border: 0; color: var(--muted); cursor: pointer; padding: 0; }
+  .prog { height: 3px; background: var(--line); border-radius: 2px; margin-top: 5px; overflow: hidden; }
+  .prog i { display: block; height: 100%; background: var(--accent); transition: width .2s; }
+  .prog.busy i { width: 35% !important; animation: busy 1.2s ease-in-out infinite; }
+  @keyframes busy { from { margin-left: -35%; } to { margin-left: 100%; } }
+
+  .empty { position: absolute; inset: 16px; display: flex; align-items: center; justify-content: center; text-align: center;
+           border: 2px dashed var(--line); border-radius: 12px; background: rgba(16,19,23,.85); }
+  .empty[hidden] { display: none; }
+  .empty b { font-size: 17px; display: block; margin-bottom: 8px; }
+  body.dropping .empty { display: flex; border-color: var(--accent); }
+
   @media (max-width: 1100px) {
     .app { grid-template-columns: 1fr; height: auto; }
     aside, .notes { border: 0; max-height: none; }
@@ -94,6 +120,15 @@
   <aside>
     <h1>Anchor Review</h1>
     <div class="sub" id="mapname"></div>
+    <div class="lib" id="lib" hidden>
+      <div class="pick">
+        <select id="demoPick" title="Processed demos"></select>
+        <button class="btn primary" id="uploadBtn">Upload</button>
+      </div>
+      <a class="btn" id="exportBtn" hidden title="Download a standalone copy of this demo's review that works offline">Download offline copy</a>
+      <input type="file" id="file" accept=".dem" multiple hidden>
+      <ul class="jobs" id="jobs"></ul>
+    </div>
     <h2>Ratings</h2>
     <table class="ratings" id="ratings"></table>
     <h2>Engagements</h2>
@@ -109,6 +144,13 @@
         <span><span class="dot" style="background:var(--t)"></span>T</span>
         <span><span class="dot" style="background:var(--anchor)"></span>Anchor</span>
         <span>dashed ring = local area</span>
+      </div>
+      <div class="empty" id="empty" hidden>
+        <div>
+          <b>Drop a CS2 .dem file here</b>
+          <button class="btn primary" id="emptyUpload">Choose a demo</button>
+          <p class="hint">It's parsed on this computer in a few seconds.</p>
+        </div>
       </div>
     </div>
     <div class="controls">
@@ -127,6 +169,7 @@
         </select>
         <button id="fit">Fit map</button>
         <button id="focus">Focus fight</button>
+        <button id="level" title="Which level of the map to show" hidden>Level: auto</button>
         <span class="spacer"></span>
         <span class="hint">space play &middot; &larr;/&rarr; 1s &middot; [ ] fight &middot; scroll zoom &middot; drag pan</span>
       </div>
@@ -138,8 +181,9 @@
 
 <script id="data" type="application/json">__DATA__</script>
 <script>
-const D = JSON.parse(document.getElementById('data').textContent);
-const TR = D.tickrate;
+// Embedded data = a standalone review.html export; null = served by the app, which handles uploads.
+const EMBEDDED = JSON.parse(document.getElementById('data').textContent);
+let D = null, TR = 64;
 const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 const C = {};
 ['--map','--map-label','--ct','--t','--anchor','--good','--bad','--contact','--muted','--text','--bg'].forEach(k => C[k.slice(2)] = css(k));
@@ -148,21 +192,34 @@ const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':
 const fmt = v => (v > 0 ? '+' : '') + v.toFixed(2);
 const cls = v => v > 0 ? 'pos' : v < 0 ? 'neg' : '';
 
-// ---------- map bounds
-const B = D.background, cell = B.cell;
-let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-for (const [x, y] of B.cells) { minX = Math.min(minX, x); maxX = Math.max(maxX, x); minY = Math.min(minY, y); maxY = Math.max(maxY, y); }
-minX *= cell; minY *= cell; maxX = (maxX + 1) * cell; maxY = (maxY + 1) * cell;
-
-// ---------- prepare reviews
-for (const R of D.reviews) {
-  for (const f of R.frames) f.m = new Map(f.p.map(e => [e[0], e]));
-  R.start = R.frames.length ? R.frames[0].t : R.contact_tick;
-  R.end = R.frames.length ? R.frames[R.frames.length - 1].t : R.contact_tick;
-  for (const e of R.events) {
-    e.apos = lastPos(R, e.attacker_id ?? e.planter_id, e.t);
-    e.vpos = lastPos(R, e.victim_id, e.t);
+// ---------- load a demo's data
+let B = null, cell = 1, minX = 0, maxX = 1, minY = 0, maxY = 1;
+let radar = { upper: null, lower: null }, level = 'auto';  // level: auto | upper | lower (two-level maps)
+function load(data) {
+  D = data; TR = D.tickrate;
+  B = D.background; cell = B.cell || 1;
+  [minX, minY, maxX, maxY] = B.bounds;
+  for (const R of D.reviews) {
+    for (const f of R.frames) f.m = new Map(f.p.map(e => [e[0], e]));
+    R.start = R.frames.length ? R.frames[0].t : R.contact_tick;
+    R.end = R.frames.length ? R.frames[R.frames.length - 1].t : R.contact_tick;
+    for (const e of R.events) {
+      e.apos = lastPos(R, e.attacker_id ?? e.planter_id, e.t);
+      e.vpos = lastPos(R, e.victim_id, e.t);
+    }
   }
+  radar = { upper: null, lower: null };
+  const img = src => { const i = new Image(); i.onload = draw; i.src = src; return i; };
+  if (D.radar) {
+    radar.upper = img(D.radar.image);
+    if (D.radar.lower) radar.lower = img(D.radar.lower.image);
+  }
+  level = 'auto'; $('level').hidden = !radar.lower; $('level').textContent = 'Level: auto';
+  R = null; filter = null; setPlaying(false);
+  $('empty').hidden = true;
+  $('mapname').textContent = `${D.map} · ${D.reviews.length} anchor engagements`;
+  renderRatings(); renderList(); fitMap();
+  if (D.reviews.length) select(D.reviews[0].id);
 }
 function lastPos(R, pid, t) {
   if (pid == null) return null;
@@ -229,8 +286,8 @@ function positions(t) {
   const [a, b, k] = fa, A = R.frames[a].m, Bm = R.frames[b].m;
   for (const [pid, e] of A) {
     const n = Bm.get(pid);
-    if (n) out.set(pid, { x: e[1] + (n[1] - e[1]) * k, y: e[2] + (n[2] - e[2]) * k, yaw: lerpAngle(e[3], n[3], k), hp: n[4] });
-    else if (a === b || k < 0.5) out.set(pid, { x: e[1], y: e[2], yaw: e[3], hp: e[4] });
+    if (n) out.set(pid, { x: e[1] + (n[1] - e[1]) * k, y: e[2] + (n[2] - e[2]) * k, yaw: lerpAngle(e[3], n[3], k), hp: n[4], z: n[5] });
+    else if (a === b || k < 0.5) out.set(pid, { x: e[1], y: e[2], yaw: e[3], hp: e[4], z: e[5] });
   }
   return out;
 }
@@ -239,17 +296,34 @@ function positions(t) {
 function draw() {
   ctx.clearRect(0, 0, W, H);
   ctx.fillStyle = C.bg; ctx.fillRect(0, 0, W, H);
-  // map silhouette
-  ctx.fillStyle = C.map;
-  const cs = cell * view.s + 0.6;
-  for (const [x, y] of B.cells) ctx.fillRect(sx(x * cell), sy((y + 1) * cell), cs, cs);
-  // place labels
-  ctx.fillStyle = C['map-label']; ctx.font = '600 11px system-ui, sans-serif'; ctx.textAlign = 'center';
-  for (const l of B.labels) ctx.fillText(l.name, sx(l.x), sy(l.y));
-  if (!R) return;
+  if (!D) return;
+  const pos = R ? positions(cur) : new Map();
+  const anchor = R ? pos.get(R.anchor_id) : null;
+  // two-level maps: follow the anchor unless a level was picked
+  const below = D.radar && D.radar.lower ? D.radar.lower.below : null;
+  const shown = below == null ? 'upper'
+    : level !== 'auto' ? level : anchor && anchor.z != null && anchor.z < below ? 'lower' : 'upper';
+  const onShown = p => below == null || p.z == null || (p.z < below) === (shown === 'lower');
 
-  const pos = positions(cur);
-  const anchor = pos.get(R.anchor_id);
+  const img = radar[shown];
+  if (img && img.complete && img.naturalWidth) {
+    // radar overview: pos_x/pos_y is the image's top-left corner in world units, scale = units per pixel
+    const s = D.radar.scale * view.s;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(img, sx(D.radar.pos_x), sy(D.radar.pos_y), img.naturalWidth * s, img.naturalHeight * s);
+  } else if (B.cells) {
+    // no radar for this map: outline it from where players stood
+    ctx.fillStyle = C.map;
+    const cs = cell * view.s + 0.6;
+    for (const [x, y] of B.cells) ctx.fillRect(sx(x * cell), sy((y + 1) * cell), cs, cs);
+  }
+  // place labels (radars have no callouts)
+  ctx.font = '600 11px system-ui, sans-serif'; ctx.textAlign = 'center';
+  ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(0,0,0,.55)'; ctx.fillStyle = img ? C.text : C['map-label'];
+  ctx.globalAlpha = img ? 0.6 : 1;
+  for (const l of B.labels) { ctx.strokeText(l.name, sx(l.x), sy(l.y)); ctx.fillText(l.name, sx(l.x), sy(l.y)); }
+  ctx.globalAlpha = 1;
+  if (!R) return;
 
   // local-area ring
   const ringAt = anchor || { x: R.spot[0], y: R.spot[1] };
@@ -281,7 +355,7 @@ function draw() {
     const col = pl.team === 'CT' ? C.ct : C.t;
     const x = sx(p.x), y = sy(p.y), r = isA ? 8 : 6;
     const a = p.yaw * Math.PI / 180;
-    ctx.globalAlpha = pl.local || isA ? 1 : 0.45;
+    ctx.globalAlpha = (pl.local || isA ? 1 : 0.45) * (onShown(p) ? 1 : 0.35);
     ctx.strokeStyle = col; ctx.lineWidth = 2;
     ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + Math.cos(a) * (r + 12), y - Math.sin(a) * (r + 12)); ctx.stroke();
     ctx.fillStyle = col; ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
@@ -309,7 +383,6 @@ function line(a, b, col, w, alpha) {
 }
 
 // ---------- UI: sidebar
-$('mapname').textContent = `${D.map} · ${D.reviews.length} anchor engagements`;
 function renderRatings() {
   const rows = D.ratings.map(r => `<tr class="row ${filter === r.player ? 'sel' : ''}" data-p="${esc(r.player)}">
       <td>${esc(shortName(r.player))}</td><td>${r.engagements}</td><td>${r.kills}/${r.exp_kills.toFixed(1)}</td>
@@ -355,7 +428,7 @@ function renderNotes() {
       <tr class="total"><td>Fight score</td><td class="${cls(total)}">${fmt(total)}</td></tr></table>
     <h2>Events</h2>
     <ul class="feed" id="feed">${R.events.map((e, i) => `<li data-i="${i}"><span class="tm">${rel(e.t)}</span><span>${eventText(e)}</span></li>`).join('')}</ul>
-    <p class="hint" style="margin-top:16px">Rating = 1.00 + average fight score. Damage only scores as a bonus when it lands on Ts the anchor didn't kill.</p>`;
+    <p class="hint" style="margin-top:16px">HLTV 3.0-style: six sub-ratings (1.00 = average anchor fight) weighted into the fight score. Rating = 1.00 + average fight score.</p>`;
   $('feed').querySelectorAll('li').forEach(li => li.onclick = () => { seek(R.events[+li.dataset.i].t - 2 * TR); });
 }
 function updateFeed() {
@@ -387,6 +460,7 @@ function select(id) {
   setPlaying(true);
 }
 function step(dir) {
+  if (!R) return;
   const v = visible(), i = v.findIndex(r => r.id === R.id);
   const n = v[(i + dir + v.length) % v.length];
   if (n) select(n.id);
@@ -407,13 +481,17 @@ function tick(now) {
 $('play').onclick = () => { if (R && cur >= R.end) seek(R.start); setPlaying(!playing); };
 $('prev').onclick = () => step(-1);
 $('next').onclick = () => step(1);
-$('tocontact').onclick = () => seek(R.contact_tick);
+$('tocontact').onclick = () => R && seek(R.contact_tick);
 $('speed').onchange = e => speed = +e.target.value;
 $('fit').onclick = fitMap;
 $('focus').onclick = focusFight;
+$('level').onclick = () => {
+  level = { auto: 'upper', upper: 'lower', lower: 'auto' }[level];
+  $('level').textContent = 'Level: ' + level; draw();
+};
 $('scrub').oninput = e => { setPlaying(false); seek(+e.target.value); };
 document.addEventListener('keydown', e => {
-  if (e.target.tagName === 'SELECT') return;
+  if (e.target.tagName === 'SELECT' || !R) return;
   if (e.code === 'Space') { e.preventDefault(); $('play').click(); }
   else if (e.key === 'ArrowRight') seek(cur + TR);
   else if (e.key === 'ArrowLeft') seek(cur - TR);
@@ -440,9 +518,115 @@ cv.addEventListener('pointermove', e => {
 });
 cv.addEventListener('pointerup', () => { dragFrom = null; cv.classList.remove('drag'); });
 
+// ---------- app mode: demo library, uploads and parse jobs
+const uploads = new Map();    // local id -> { name, pct }
+const notices = [];           // client-side errors, e.g. a rejected upload
+const dismissed = new Set();  // server job ids whose error was closed
+const opened = new Set();     // finished job ids already acted on
+let jobs = [], wanted = new Set(), demos = [], uploadSeq = 0;
+
+async function getJSON(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.statusText);
+  return r.json();
+}
+async function refreshDemos(open) {
+  demos = await getJSON('/api/demos');
+  $('demoPick').innerHTML = demos.length
+    ? demos.map(d => `<option value="${esc(d.name)}">${esc(d.name)} · ${esc(d.map)} · ${d.engagements} fights</option>`).join('')
+    : '<option value="">No demos yet</option>';
+  if (open) await openDemo(open);
+  else if (!D && demos.length) await openDemo(demos[0].name);
+  else if (D) $('demoPick').value = D.name || '';
+  if (!demos.length && !D) $('empty').hidden = false;
+}
+async function openDemo(name) {
+  try {
+    const data = await getJSON('/api/demos/' + encodeURIComponent(name));
+    data.name = name;
+    load(data);
+    $('demoPick').value = name;
+    $('exportBtn').href = `/api/demos/${encodeURIComponent(name)}/export`;
+    $('exportBtn').hidden = false;
+  } catch (e) { notices.push(`Couldn't open ${name}: ${e.message}`); renderJobs(); }
+}
+
+function renderJobs() {
+  const items = [];
+  for (const u of uploads.values())
+    items.push(`<li><div class="nm">${esc(u.name)}</div><div class="st"><span>Uploading</span><span>${u.pct}%</span></div>
+      <div class="prog"><i style="width:${u.pct}%"></i></div></li>`);
+  for (const j of jobs) {
+    if (j.status === 'queued' || j.status === 'parsing')
+      items.push(`<li><div class="nm">${esc(j.name)}</div><div class="st"><span>${j.status === 'queued' ? 'Waiting for the parser' : 'Parsing demo…'}</span></div>
+        <div class="prog busy"><i></i></div></li>`);
+    else if (j.status === 'error' && !dismissed.has(j.id))
+      items.push(`<li class="err"><div class="nm">${esc(j.name)}</div><div class="st"><span>${esc(j.message)}</span>
+        <button class="x" data-job="${esc(j.id)}" title="Dismiss">&times;</button></div></li>`);
+  }
+  notices.forEach((n, i) => items.push(`<li class="err"><div class="st"><span>${esc(n)}</span>
+      <button class="x" data-note="${i}" title="Dismiss">&times;</button></div></li>`));
+  $('jobs').innerHTML = items.join('');
+  $('jobs').querySelectorAll('[data-job]').forEach(b => b.onclick = () => { dismissed.add(b.dataset.job); renderJobs(); });
+  $('jobs').querySelectorAll('[data-note]').forEach(b => b.onclick = () => { notices.splice(+b.dataset.note, 1); renderJobs(); });
+}
+
+async function pollJobs() {
+  try {
+    jobs = await getJSON('/api/jobs');
+    const finished = jobs.filter(j => j.status === 'done' && !opened.has(j.id));
+    finished.forEach(j => opened.add(j.id));
+    const mine = finished.filter(j => wanted.has(j.id)).pop();
+    if (finished.length) await refreshDemos(mine ? mine.demo : null);
+    renderJobs();
+  } catch (e) { /* server restarting or closed; try again shortly */ }
+  setTimeout(pollJobs, 1500);
+}
+
+function upload(file) {
+  if (!/\.dem$/i.test(file.name)) { notices.push(`${file.name} isn't a .dem file.`); renderJobs(); return; }
+  const id = ++uploadSeq;
+  uploads.set(id, { name: file.name, pct: 0 });
+  renderJobs();
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', '/api/upload?name=' + encodeURIComponent(file.name));
+  xhr.upload.onprogress = e => {
+    if (e.lengthComputable) { uploads.get(id).pct = Math.round(e.loaded / e.total * 100); renderJobs(); }
+  };
+  xhr.onloadend = () => {
+    uploads.delete(id);
+    let res = {};
+    try { res = JSON.parse(xhr.responseText); } catch (e) {}
+    if (xhr.status === 200) { wanted.add(res.id); jobs.push(res); }
+    else notices.push(res.error || `Uploading ${file.name} failed.`);
+    renderJobs();
+  };
+  xhr.send(file);
+}
+
+function startApp() {
+  $('lib').hidden = false;
+  const pick = () => $('file').click();
+  $('uploadBtn').onclick = pick;
+  $('emptyUpload').onclick = pick;
+  $('file').onchange = e => { [...e.target.files].forEach(upload); e.target.value = ''; };
+  $('demoPick').onchange = e => e.target.value && openDemo(e.target.value);
+  let depth = 0;  // dragenter/leave fire for every child element
+  const hasFiles = e => [...(e.dataTransfer?.types || [])].includes('Files');
+  window.addEventListener('dragenter', e => { if (hasFiles(e)) { depth++; document.body.classList.add('dropping'); } });
+  window.addEventListener('dragleave', () => { if (--depth <= 0) { depth = 0; document.body.classList.remove('dropping'); } });
+  window.addEventListener('dragover', e => { if (hasFiles(e)) e.preventDefault(); });
+  window.addEventListener('drop', e => {
+    e.preventDefault(); depth = 0; document.body.classList.remove('dropping');
+    [...e.dataTransfer.files].forEach(upload);
+  });
+  refreshDemos().catch(e => { notices.push(e.message); renderJobs(); });
+  pollJobs();
+}
+
 window.addEventListener('resize', resize);
-renderRatings(); renderList(); resize(); fitMap();
-if (D.reviews.length) select(D.reviews[0].id);
+resize();
+if (EMBEDDED) load(EMBEDDED); else startApp();
 requestAnimationFrame(tick);
 </script>
 </body>

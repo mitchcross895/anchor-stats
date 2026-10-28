@@ -2,7 +2,8 @@
 anchor-stats.py - Rate CS2 site anchors from a .dem file.
 
 Usage:
-    python anchor-stats.py                # every .dem in demos/ -> output/<demo name>/
+    python anchor-stats.py                # open the viewer app; upload demos there
+    python anchor-stats.py --batch        # every new .dem in demos/ -> output/<demo name>/
     python anchor-stats.py match.dem
     python anchor-stats.py match.dem --player "s1mple" --csv anchors.csv
     python anchor-stats.py match.dem --extra-places "BombsiteB:Bench,Market"
@@ -22,19 +23,38 @@ How it works
    Ts and CTs within LOCAL_RADIUS units of the anchor around that moment are
    counted, which gives the situation (1v4, 2v3, ...).
 
-3. Score: kills are compared with what an average anchor would get in that
-   situation, and each kill is worth more the worse the odds. Chip damage,
-   time bought and surviving add small bonuses, so a 1v4 with 2 kills scores
-   well and a 1v4 with 0 kills scores badly.
+3. Score, modelled on HLTV Rating 3.0: each fight gets six sub-ratings where
+   1.00 is an average anchor fight in that situation:
+     Kills        eco-adjusted kills vs what an average anchor gets at those odds
+     Damage       eco-adjusted damage vs the same expectation
+     Survival     alive at the end after fighting for the site
+     KAST         got a kill or assist, survived, or was traded
+     Multi-kill   2+ kill fights
+     Round swing  how much the anchor's kills (shared by damage dealt) and death
+                  moved the CTs' chance of winning the round
+   The eco adjustment makes kills on worse-equipped Ts worth less and kills on
+   better-equipped Ts worth more. Sub-ratings are weighted (see COMPONENTS);
+   fight score = weighted sum of (sub-rating - 1).
 
-   Anchor Rating = 1.00 + average engagement score (1.00 is roughly average).
+   Anchor Rating = 1.00 + average fight score (1.00 is roughly average).
 """
 
 import argparse
+import base64
+import functools
 import json
+import math
 import os
+import queue
+import re
 import sys
+import threading
+import time
+import uuid
+import webbrowser
 from collections import Counter, defaultdict
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, unquote, urlparse
 
 import pandas as pd
 from demoparser2 import DemoParser
@@ -55,14 +75,24 @@ MAX_CLIP = 45                 # viewer: longest clip, in seconds after contact
 
 # Kills an average anchor gets, by number of local enemies (before teammate help).
 EXPECTED_KILLS = {1: 0.50, 2: 0.60, 3: 0.65, 4: 0.70, 5: 0.75}
-KILL_ODDS_BONUS = 0.20        # each kill is worth 1 + this * (odds - 1)
-CHIP_DAMAGE_WEIGHT = 0.003    # per HP of damage on Ts the anchor did not kill
-CHIP_DAMAGE_CAP = 0.30
-TIME_HELD_WEIGHT = 0.02       # per second alive after contact
-TIME_HELD_CAP = 0.30
-SURVIVAL_BONUS = 0.20
-ASSIST_VALUE = 0.25
-NO_CONTACT_PENALTY = 0.25     # bomb planted on your site and you never fought
+DAMAGE_PER_EXPECTED_KILL = 120  # an average anchor's damage = this x expected kills
+TRADE_WINDOW = 5              # seconds; a death avenged within this counts as traded
+TRADED_DEATH_SHARE = 0.5      # share of the round-swing cost a traded death still carries
+NO_CONTACT_PLANT_SHARE = 0.5  # share of the plant's round swing charged to an anchor who never fought
+MULTI_KILL_VALUE = {0: 0, 1: 0, 2: 1, 3: 2, 4: 3, 5: 4}
+
+# HLTV 3.0-style sub-ratings. Each is 1 + (fight value - average) / spread, so
+# 1.00 is an average anchor fight; the weights mirror 3.0's emphasis on kills
+# and round swing (HLTV has not published its exact weights).
+#   name: (label, report column, weight, average, spread)
+COMPONENTS = {
+    "kills":    ("Kills", "kill_r", 0.30, None, 0.80),         # eco-adjusted; average = EXPECTED_KILLS
+    "damage":   ("Damage", "dmg_r", 0.15, None, 120),          # eco-adjusted; average = DAMAGE_PER_EXPECTED_KILL x expected
+    "survival": ("Survival", "surv_r", 0.10, 0.30, 0.70),
+    "kast":     ("KAST", "kast_r", 0.10, 0.60, 0.80),          # kill, assist, survived or traded
+    "multi":    ("Multi-kill", "multi_r", 0.05, 0.12, 0.80),   # MULTI_KILL_VALUE
+    "swing":    ("Round swing", "swing_r", 0.30, 0.00, 0.20),  # change in the CTs' round win probability
+}
 
 # Place names (from the map's nav mesh) that count as each site. Any place
 # containing "BombsiteA"/"BombsiteB" is always included; add common anchor
@@ -75,17 +105,34 @@ MAP_EXTRA_PLACES = {
     # "de_mirage": {"B": {"Bench", "Market"}},
 }
 
+# Events read from the demo, with the columns the analysis relies on (an event
+# that never happens comes back missing, so it gets these columns empty).
+EVENTS = {
+    "round_freeze_end": ["tick"],
+    "round_end": ["tick", "winner"],
+    "round_announce_match_start": ["tick"],
+    "player_death": ["tick", "user_steamid", "attacker_steamid", "assister_steamid", "weapon", "headshot"],
+    "player_hurt": ["tick", "user_steamid", "attacker_steamid", "dmg_health"],
+    "bomb_planted": ["tick", "user_steamid"],
+}
+
 T_TEAM, CT_TEAM = 2, 3
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DEMOS_DIR = os.path.join(HERE, "demos")
+OUTPUT_DIR = os.path.join(HERE, "output")
+MAPS_DIR = os.path.join(HERE, "maps")  # <map>.png radar + <map>.txt overview, from the game files
+TEMPLATE = os.path.join(HERE, "anchor-viewer-template.html")
 
 
 # ----------------------------------------------------------------- helpers --
 def site_of(place, site_places):
     if not isinstance(place, str):
-        return None
+        return ""
     for site, places in site_places.items():
         if place in places or f"Bombsite{site}" in place:
             return site
-    return None
+    return ""
 
 
 def num(v):
@@ -102,28 +149,44 @@ def sid(x):
     return str(int(x)) if not isinstance(x, str) else x
 
 
-def event_df(parser, name, **kw):
-    try:
-        df = parser.parse_event(name, **kw)
-    except Exception:
-        return pd.DataFrame()
-    return df if isinstance(df, pd.DataFrame) else pd.DataFrame(df)
+def ct_win_prob(ct, t, planted):
+    """Rough chance the CTs win from ct-vs-t alive, before or after the plant."""
+    if ct <= 0:
+        return 0.0
+    if t <= 0:
+        return 0.9 if planted else 1.0  # post-plant they still have to defuse
+    x = 0.6 * (ct - t) + math.log(ct / t) - (1.0 if planted else 0.0)
+    return 1 / (1 + math.exp(-x))
 
 
-def get_rounds(parser):
+def econ_factor(victim_value, anchor_value):
+    """Kills on worse-equipped Ts are worth less, on better-equipped Ts more (HLTV 3.0 eco adjustment)."""
+    return min(1.3, max(0.6, ((victim_value + 500) / (anchor_value + 500)) ** 0.35))
+
+
+def parse_events(parser):
+    """Every event in EVENTS from one pass over the demo."""
+    found = dict(parser.parse_events(list(EVENTS)))
+    events = {}
+    for name, cols in EVENTS.items():
+        df = found.get(name, pd.DataFrame())
+        df = df.reindex(columns=list(dict.fromkeys([*df.columns, *cols])))
+        for col in ("attacker_steamid", "user_steamid", "assister_steamid"):
+            if col in df.columns:
+                df[col] = df[col].map(sid)
+        events[name] = df
+    return events
+
+
+def get_rounds(events):
     """Return a list of (round_no, freeze_end_tick, end_tick, winner)."""
-    freeze = event_df(parser, "round_freeze_end")
-    ends = event_df(parser, "round_end")
-    start = event_df(parser, "round_announce_match_start")
+    freeze, ends, start = events["round_freeze_end"], events["round_end"], events["round_announce_match_start"]
     if freeze.empty:
         raise ValueError("No round_freeze_end events found - is this a CS2 demo?")
 
     match_start = int(start["tick"].max()) if not start.empty else 0
     freeze_ticks = sorted(int(t) for t in freeze["tick"] if t >= match_start)
-    end_rows = sorted(
-        ((int(r.tick), r.winner if "winner" in ends.columns else None) for r in ends.itertuples()),
-        key=lambda x: x[0],
-    ) if not ends.empty else []
+    end_rows = sorted((int(r.tick), r.winner) for r in ends.itertuples())
 
     rounds = []
     for i, ft in enumerate(freeze_ticks):
@@ -143,37 +206,33 @@ def get_rounds(parser):
 # -------------------------------------------------------------------- core --
 def analyse(path, site_places):
     parser = DemoParser(path)
-    header = parser.parse_header()
-    map_name = header.get("map_name", "unknown")
+    map_name = os.path.basename(parser.parse_header().get("map_name", "unknown"))
     for site, extra in MAP_EXTRA_PLACES.get(map_name, {}).items():
         site_places.setdefault(site, set()).update(extra)
 
-    rounds = get_rounds(parser)
+    events = parse_events(parser)
+    deaths, hurts, plants = events["player_death"], events["player_hurt"], events["bomb_planted"]
+    rounds = get_rounds(events)
 
     sample_ticks = sorted({t for _, ft, et, _ in rounds for t in range(ft, et + 1, SAMPLE_EVERY)})
     ticks = parser.parse_ticks(
-        ["X", "Y", "Z", "yaw", "health", "last_place_name", "team_num", "is_alive"], ticks=sample_ticks
+        ["X", "Y", "Z", "yaw", "health", "last_place_name", "team_num", "is_alive", "current_equip_value"],
+        ticks=sample_ticks,
     )
+    ticks = ticks[ticks["is_alive"] == True].sort_values("tick")  # noqa: E712
     ticks["steamid"] = ticks["steamid"].map(sid)
-    ticks = ticks[ticks["is_alive"] == True]  # noqa: E712
+    sites = {p: site_of(p, site_places) for p in ticks["last_place_name"].unique()}
+    ticks["site"] = ticks["last_place_name"].map(sites)
     names = dict(zip(ticks["steamid"], ticks["name"]))
 
-    deaths = event_df(parser, "player_death")
-    hurts = event_df(parser, "player_hurt")
-    plants = event_df(parser, "bomb_planted")
-    for df in (deaths, hurts, plants):
-        for col in ("attacker_steamid", "user_steamid", "assister_steamid"):
-            if col in df.columns:
-                df[col] = df[col].map(sid)
-
-    by_tick = {t: g for t, g in ticks.groupby("tick")}
     engagements, reviews = [], []
-
     for rnd, ft, et, winner in rounds:
         rticks = ticks[(ticks["tick"] >= ft) & (ticks["tick"] <= et)]
         if rticks.empty:
             continue
         team_of = dict(zip(rticks["steamid"], rticks["team_num"]))
+        # what each player bought (equipment value once the buy is done)
+        buy = rticks[rticks["tick"] <= ft + SETUP_END * TICKRATE].groupby("steamid")["current_equip_value"].max()
 
         # ---- 1. who anchored which site?
         setup = rticks[
@@ -181,57 +240,60 @@ def analyse(path, site_places):
             & (rticks["tick"] >= ft + SETUP_START * TICKRATE)
             & (rticks["tick"] <= ft + SETUP_END * TICKRATE)
         ]
-        ct_site = {}
-        for player, g in setup.groupby("steamid"):
-            sites = Counter(site_of(p, site_places) for p in g["last_place_name"])
-            site, n = sites.most_common(1)[0]
-            if site and n / len(g) >= SETUP_MIN_SHARE:
-                spot = (g["X"].mean(), g["Y"].mean(), g["Z"].mean())
-                ct_site[player] = (site, spot)
-
         per_site = defaultdict(list)
-        for p, (s, spot) in ct_site.items():
-            per_site[s].append((p, spot))
+        for player, g in setup.groupby("steamid"):
+            site, n = Counter(g["site"]).most_common(1)[0]
+            if site and n / len(g) >= SETUP_MIN_SHARE:
+                per_site[site].append((player, (g["X"].mean(), g["Y"].mean(), g["Z"].mean())))
 
-        r_deaths = deaths[(deaths["tick"] >= ft) & (deaths["tick"] <= et)] if not deaths.empty else deaths
-        r_hurts = hurts[(hurts["tick"] >= ft) & (hurts["tick"] <= et)] if not hurts.empty else hurts
-        r_plants = plants[(plants["tick"] >= ft) & (plants["tick"] <= et)] if not plants.empty else plants
+        r_deaths = deaths[(deaths["tick"] >= ft) & (deaths["tick"] <= et)].sort_values("tick")
+        r_hurts = hurts[(hurts["tick"] >= ft) & (hurts["tick"] <= et)]
+        r_plants = plants[(plants["tick"] >= ft) & (plants["tick"] <= et)]
+        plant_tick = int(r_plants["tick"].min()) if not r_plants.empty else None
+
+        # CT win probability before and after every death, for round swing
+        totals = {team: sum(1 for v in team_of.values() if v == team) for team in (CT_TEAM, T_TEAM)}
+        alive = dict(totals)
+        swings = []  # (death row, ct win prob before, after)
+        for d in r_deaths.itertuples():
+            planted = plant_tick is not None and plant_tick <= d.tick
+            before = ct_win_prob(alive[CT_TEAM], alive[T_TEAM], planted)
+            if team_of.get(d.user_steamid) in alive:
+                alive[team_of[d.user_steamid]] -= 1
+            swings.append((d, before, ct_win_prob(alive[CT_TEAM], alive[T_TEAM], planted)))
 
         for site, members in per_site.items():
             if len(members) != 1:
                 continue  # stacked site, not an anchor
             anchor, spot = members[0]
-            a_ticks = rticks[rticks["steamid"] == anchor].set_index("tick")
-            death_row = r_deaths[r_deaths["user_steamid"] == anchor] if not r_deaths.empty else r_deaths
+            a_ticks = rticks[rticks["steamid"] == anchor]
+            a_tick, a_xyz = a_ticks["tick"].to_numpy(), a_ticks[["X", "Y", "Z"]].to_numpy()
+            death_row = r_deaths[r_deaths["user_steamid"] == anchor]
             death_tick = int(death_row["tick"].iloc[0]) if len(death_row) else None
 
             def anchor_pos(tick):
-                near = a_ticks.index[a_ticks.index <= tick]
-                if len(near) == 0:
-                    return None
-                r = a_ticks.loc[near[-1]]
-                return (r["X"], r["Y"], r["Z"])
+                i = a_tick.searchsorted(tick, side="right") - 1
+                return a_xyz[i] if i >= 0 else None
 
             # ---- 2. find contact on the anchor's site
             contact_tick, contact_kind = None, None
-            if not r_hurts.empty:
-                involved = r_hurts[
-                    ((r_hurts["attacker_steamid"] == anchor) | (r_hurts["user_steamid"] == anchor))
-                    & (r_hurts["tick"] >= ft + SETUP_START * TICKRATE)
-                ]
-                for h in involved.itertuples():
-                    other = h.user_steamid if h.attacker_steamid == anchor else h.attacker_steamid
-                    if team_of.get(other) != T_TEAM:
-                        continue
-                    pos = anchor_pos(h.tick)
-                    if pos is not None and dist(pos, spot) <= ANCHOR_LEASH:
-                        contact_tick, contact_kind = int(h.tick), "fight"
-                    break
+            involved = r_hurts[
+                ((r_hurts["attacker_steamid"] == anchor) | (r_hurts["user_steamid"] == anchor))
+                & (r_hurts["tick"] >= ft + SETUP_START * TICKRATE)
+            ]
+            for h in involved.itertuples():
+                other = h.user_steamid if h.attacker_steamid == anchor else h.attacker_steamid
+                if team_of.get(other) != T_TEAM:
+                    continue
+                pos = anchor_pos(h.tick)
+                if pos is not None and dist(pos, spot) <= ANCHOR_LEASH:
+                    contact_tick, contact_kind = int(h.tick), "fight"
+                break
 
             plant_here = None
-            for p in (r_plants.itertuples() if not r_plants.empty else []):
+            for p in r_plants.itertuples():
                 planter = rticks[(rticks["steamid"] == p.user_steamid) & (rticks["tick"] <= p.tick)]
-                if len(planter) and site_of(planter["last_place_name"].iloc[-1], site_places) == site:
+                if len(planter) and planter["site"].iloc[-1] == site:
                     plant_here = int(p.tick)
 
             if contact_tick is None:
@@ -239,74 +301,109 @@ def analyse(path, site_places):
                     continue  # the hit never came to this anchor
                 contact_tick, contact_kind = plant_here, "no contact"
 
-            # ---- 3. who was in the local area?
+            # ---- 3. who was in the local area? (near the anchor, or on their site)
             lo = contact_tick - LOCAL_WINDOW_BEFORE * TICKRATE
             hi = contact_tick + LOCAL_WINDOW_AFTER * TICKRATE
             if death_tick is not None:
                 hi = min(hi, death_tick)
             hi = max(hi, contact_tick)
-            enemies, mates = set(), set()
-            for t in range(lo - lo % SAMPLE_EVERY, hi + 1, SAMPLE_EVERY):
-                g = by_tick.get(t)
-                pos = anchor_pos(t)
-                if g is None or pos is None:
-                    continue
-                for r in g.itertuples():
-                    if r.steamid == anchor:
-                        continue
-                    if dist(pos, (r.X, r.Y, r.Z)) <= LOCAL_RADIUS or site_of(r.last_place_name, site_places) == site:
-                        (enemies if r.team_num == T_TEAM else mates).add(r.steamid)
+            near = rticks[(rticks["tick"] >= lo - lo % SAMPLE_EVERY) & (rticks["tick"] <= hi)
+                          & (rticks["steamid"] != anchor)]
+            if len(a_tick):
+                idx = a_tick.searchsorted(near["tick"].to_numpy(), side="right") - 1
+                seen = idx >= 0  # samples before the anchor's first one have no anchor position
+                near, idx = near[seen], idx[seen]
+                gap = ((near[["X", "Y", "Z"]].to_numpy() - a_xyz[idx]) ** 2).sum(axis=1) ** 0.5
+                near = near[(gap <= LOCAL_RADIUS) | (near["site"] == site).to_numpy()]
+            else:
+                near = near.iloc[0:0]
+            enemies = set(near.loc[near["team_num"] == T_TEAM, "steamid"])
+            mates = set(near.loc[near["team_num"] != T_TEAM, "steamid"])
             # teammates who were dead before contact don't count
-            mates = {m for m in mates
-                     if not ((r_deaths["user_steamid"] == m) & (r_deaths["tick"] < contact_tick)).any()}
+            mates -= set(r_deaths.loc[r_deaths["tick"] < contact_tick, "user_steamid"])
 
             # ---- 4. what did the anchor do? (contact .. death / round end)
             end_tick = death_tick if death_tick is not None else et
+            in_window = lambda df: df[(df["tick"] >= lo) & (df["tick"] <= end_tick)]
+            w_hurts, w_deaths = in_window(r_hurts), in_window(r_deaths)
             # whoever hurt the anchor was obviously local
-            for h in (r_hurts.itertuples() if not r_hurts.empty else []):
-                if h.user_steamid == anchor and lo <= h.tick <= end_tick and team_of.get(h.attacker_steamid) == T_TEAM:
-                    enemies.add(h.attacker_steamid)
-            kills_df = r_deaths[
-                (r_deaths["attacker_steamid"] == anchor)
-                & (r_deaths["tick"] >= lo) & (r_deaths["tick"] <= end_tick)
-                & (r_deaths["user_steamid"].map(team_of) == T_TEAM)
-            ]
-            killed = set(kills_df["user_steamid"])
+            enemies |= set(w_hurts.loc[(w_hurts["user_steamid"] == anchor)
+                                       & (w_hurts["attacker_steamid"].map(team_of) == T_TEAM), "attacker_steamid"])
+            kills_df = w_deaths[(w_deaths["attacker_steamid"] == anchor)
+                                & (w_deaths["user_steamid"].map(team_of) == T_TEAM)]
             kills = len(kills_df)
-            assists = 0
-            if "assister_steamid" in r_deaths.columns:
-                assists = int(((r_deaths["assister_steamid"] == anchor)
-                               & (r_deaths["tick"] >= lo) & (r_deaths["tick"] <= end_tick)).sum())
-            dmg_df = r_hurts[
-                (r_hurts["attacker_steamid"] == anchor)
-                & (r_hurts["tick"] >= lo) & (r_hurts["tick"] <= end_tick)
-                & (r_hurts["user_steamid"].map(team_of) == T_TEAM)
-            ] if not r_hurts.empty else pd.DataFrame(columns=["dmg_health", "user_steamid"])
+            assists = int((w_deaths["assister_steamid"] == anchor).sum())
+            dmg_df = w_hurts[(w_hurts["attacker_steamid"] == anchor)
+                             & (w_hurts["user_steamid"].map(team_of) == T_TEAM)]
             damage = int(dmg_df["dmg_health"].sum())
-            chip = int(dmg_df[~dmg_df["user_steamid"].isin(killed)]["dmg_health"].sum())
             # and so was anyone the anchor killed or hurt
-            enemies |= killed | set(dmg_df["user_steamid"])
+            enemies |= set(kills_df["user_steamid"]) | set(dmg_df["user_steamid"])
             n_enemies = max(1, min(5, len(enemies)))
             survived = death_tick is None
             held = max(0.0, ((death_tick or et) - contact_tick) / TICKRATE)
 
-            # ---- 5. score it
-            odds = n_enemies / (1 + len(mates))
-            kill_value = 1 + KILL_ODDS_BONUS * (odds - 1)
+            # ---- 5. score it, HLTV 3.0 style
             expected = EXPECTED_KILLS[n_enemies] / (1 + 0.5 * len(mates))
             situation = f"{1 + len(mates)}v{n_enemies}"
-            parts = [
-                ("Kills vs expected", (kills - expected) * kill_value,
-                 f"({kills} - {expected:.2f} expected) x {kill_value:.2f} for {situation} odds"),
-                ("Assists", assists * ASSIST_VALUE, f"{assists} x {ASSIST_VALUE}"),
-                ("Chip damage", min(CHIP_DAMAGE_CAP, chip * CHIP_DAMAGE_WEIGHT),
-                 f"{chip} dmg on Ts they didn't kill x {CHIP_DAMAGE_WEIGHT} (cap {CHIP_DAMAGE_CAP})"),
-                ("Time held", min(TIME_HELD_CAP, held * TIME_HELD_WEIGHT) if contact_kind == "fight" else 0,
-                 f"{held:.1f}s alive after contact x {TIME_HELD_WEIGHT} (cap {TIME_HELD_CAP})"),
-                ("Survived", SURVIVAL_BONUS if survived and kills > 0 else 0, "alive at the end with a kill"),
-                ("No contact", -NO_CONTACT_PENALTY if contact_kind == "no contact" else 0,
-                 "bomb planted on their site without a fight"),
-            ]
+            fought = contact_kind == "fight"
+            eco = {v: econ_factor(buy.get(v, 0), buy.get(anchor, 0)) for v in enemies}
+            eco_kills = sum(eco.get(v, 1.0) for v in kills_df["user_steamid"])
+            eco_damage = sum(h.dmg_health * eco.get(h.user_steamid, 1.0) for h in dmg_df.itertuples())
+            traded = False
+            if death_tick is not None:
+                killer = death_row["attacker_steamid"].iloc[0]
+                traded = bool(((r_deaths["user_steamid"] == killer) & (r_deaths["tick"] > death_tick)
+                               & (r_deaths["tick"] <= death_tick + TRADE_WINDOW * TICKRATE)).any())
+            kast = kills > 0 or assists > 0 or (survived and fought) or traded
+
+            # round swing: the anchor's share of each kill's win-probability change, minus their death's.
+            # A kill's credit is half to the killer and half split by damage dealt to the victim.
+            swing = 0.0
+            for d, before, after in swings:
+                if not lo <= d.tick <= end_tick:
+                    continue
+                if d.user_steamid == anchor:
+                    share = TRADED_DEATH_SHARE if traded else 1.0
+                elif team_of.get(d.user_steamid) == T_TEAM:
+                    hits = r_hurts[(r_hurts["user_steamid"] == d.user_steamid) & (r_hurts["tick"] <= d.tick)
+                                   & (r_hurts["attacker_steamid"].map(team_of) == CT_TEAM)]
+                    total = hits["dmg_health"].sum()
+                    mine = hits.loc[hits["attacker_steamid"] == anchor, "dmg_health"].sum()
+                    share = (0.5 if d.attacker_steamid == anchor else 0) + (0.5 * mine / total if total else 0)
+                else:
+                    continue
+                swing += share * (after - before)
+            if not fought and plant_here is not None:
+                dead = r_deaths.loc[r_deaths["tick"] < plant_here, "user_steamid"].map(team_of)
+                ct_n = totals[CT_TEAM] - int((dead == CT_TEAM).sum())
+                t_n = totals[T_TEAM] - int((dead == T_TEAM).sum())
+                swing += NO_CONTACT_PLANT_SHARE * (ct_win_prob(ct_n, t_n, True) - ct_win_prob(ct_n, t_n, False))
+            swing = float(swing)
+
+            values = {  # name: (fight value, average for this fight or None for the COMPONENTS average)
+                "kills": (eco_kills, expected),
+                "damage": (eco_damage, DAMAGE_PER_EXPECTED_KILL * expected),
+                "survival": (float(survived and fought), None),
+                "kast": (float(kast), None),
+                "multi": (MULTI_KILL_VALUE[min(kills, 5)], None),
+                "swing": (swing, None),
+            }
+            details = {
+                "kills": f"{eco_kills:.2f} eco-adjusted kills ({kills} raw) vs {expected:.2f} expected in a {situation}",
+                "damage": f"{eco_damage:.0f} eco-adjusted damage ({damage} raw) vs "
+                          f"{DAMAGE_PER_EXPECTED_KILL * expected:.0f} expected",
+                "survival": "survived after fighting" if survived and fought else
+                            "survived without fighting (no credit)" if survived else "died",
+                "kast": "kill, assist, survived or traded" if kast else "no kill, assist, survival or trade",
+                "multi": f"{kills}-kill fight",
+                "swing": f"{swing * 100:+.1f}% CT round win probability",
+            }
+            sub, parts = {}, []
+            for name, (label, _, weight, avg, spread) in COMPONENTS.items():
+                x, fight_avg = values[name]
+                sub[name] = 1 + (x - (avg if fight_avg is None else fight_avg)) / spread
+                parts.append((label, weight * (sub[name] - 1),
+                              f"{details[name]} -> {sub[name]:.2f} rating x {weight:.2f} weight"))
             score = sum(v for _, v, _ in parts)
 
             # ---- 6. plain-English reasons, for the viewer
@@ -316,29 +413,29 @@ def analyse(path, site_places):
                                        "with " + ", ".join(names.get(m, m) for m in mates) + " nearby")
                 + f"; {n_enemies} T{'s' if n_enemies > 1 else ''} were local ({enemy_names})."
             ]
-            if contact_kind == "no contact":
+            if not fought:
                 notes.append(f"Never traded damage with a T before the bomb went down on {site}.")
             if kills == 0:
-                notes.append(f"No kills. An average anchor gets {expected:.2f} in a {situation}, "
-                             "so this counts against them.")
+                notes.append(f"No kills. An average anchor gets {expected:.2f} in a {situation}.")
             else:
                 notes.append(f"{kills} kill{'s' if kills > 1 else ''} vs the {expected:.2f} an average anchor "
                              f"gets in a {situation}"
-                             + (f"; each kill is worth x{kill_value:.2f} at these odds." if kill_value > 1 else "."))
+                             + (f", worth {eco_kills:.2f} after adjusting for the Ts' equipment vs theirs."
+                                if abs(eco_kills - kills) >= 0.05 else "."))
             if survived:
-                notes.append("Survived the round" + (" with a kill, which earns a bonus." if kills else ".")
-                             if contact_kind == "fight" else "Survived, but never fought for the site.")
+                notes.append("Survived the round." if fought else
+                             "Survived, but never fought for the site, so it gets no survival credit.")
             else:
                 notes.append(f"Died {held:.1f}s after first contact"
-                             + (", too quickly to buy much time." if held < 3 else
-                                f", buying time for rotations (+{parts[3][1]:.2f})." if contact_kind == "fight" else "."))
-            if chip:
-                notes.append(f"{chip} damage on Ts they didn't finish (+{parts[2][1]:.2f}"
-                             + (", capped)." if chip * CHIP_DAMAGE_WEIGHT > CHIP_DAMAGE_CAP else ")."))
+                             + (f", but was traded within {TRADE_WINDOW}s (counts for KAST, halves the swing cost)."
+                                if traded else ", untraded."))
             if assists:
-                notes.append(f"{assists} assist{'s' if assists > 1 else ''} (+{parts[1][1]:.2f}).")
+                notes.append(f"{assists} assist{'s' if assists > 1 else ''}, which counts for KAST.")
+            notes.append(f"Round swing {swing * 100:+.1f}%: how much their kills"
+                         + ("" if survived else " and death") + " moved the CTs' chance of winning the round"
+                         + (", including the plant they let through." if not fought and plant_here else "."))
             notes.append(("Ts planted on " if plant_here else "Ts never planted on ") + site
-                         + f"; CTs {'won' if winner == 'CT' else 'lost'} the round (context only, not scored).")
+                         + f"; CTs {'won' if winner == 'CT' else 'lost'} the round.")
 
             # ---- 7. playback clip for the viewer
             view_lo = max(ft, contact_tick - PRE_ROLL * TICKRATE)
@@ -346,31 +443,31 @@ def analyse(path, site_places):
             clip = rticks[(rticks["tick"] >= view_lo) & (rticks["tick"] <= view_hi)]
             pids = list(dict.fromkeys(clip["steamid"]))
             pidx = {p: i for i, p in enumerate(pids)}
-            frames = [{"t": int(t), "p": [[pidx[r.steamid], num(r.X), num(r.Y), num(r.yaw), num(r.health)]
+            frames = [{"t": int(t), "p": [[pidx[r.steamid], num(r.X), num(r.Y), num(r.yaw), num(r.health), num(r.Z)]
                                            for r in g.itertuples()]}
                       for t, g in clip.groupby("tick")]
-            events = [{"t": contact_tick, "type": "contact"}]
-            for d in (r_deaths.itertuples() if not r_deaths.empty else []):
-                if view_lo <= d.tick <= view_hi:
-                    events.append({"t": int(d.tick), "type": "kill",
-                                   "attacker": names.get(d.attacker_steamid, "world"),
-                                   "victim": names.get(d.user_steamid, "?"),
-                                   "attacker_id": pidx.get(d.attacker_steamid), "victim_id": pidx.get(d.user_steamid),
-                                   "weapon": str(getattr(d, "weapon", "") or ""),
-                                   "hs": bool(getattr(d, "headshot", False)),
-                                   "by_anchor": d.attacker_steamid == anchor, "anchor_died": d.user_steamid == anchor})
-            for h in (r_hurts.itertuples() if not r_hurts.empty else []):
-                if view_lo <= h.tick <= view_hi and anchor in (h.attacker_steamid, h.user_steamid):
-                    events.append({"t": int(h.tick), "type": "hurt",
-                                   "attacker": names.get(h.attacker_steamid, "world"),
-                                   "victim": names.get(h.user_steamid, "?"),
-                                   "attacker_id": pidx.get(h.attacker_steamid), "victim_id": pidx.get(h.user_steamid),
-                                   "dmg": int(h.dmg_health), "by_anchor": h.attacker_steamid == anchor})
-            for p in (r_plants.itertuples() if not r_plants.empty else []):
-                if view_lo <= p.tick <= view_hi:
-                    events.append({"t": int(p.tick), "type": "plant", "planter": names.get(p.user_steamid, "?"),
-                                   "planter_id": pidx.get(p.user_steamid)})
-            events.sort(key=lambda e: e["t"])
+            in_view = lambda df: df[(df["tick"] >= view_lo) & (df["tick"] <= view_hi)].itertuples()
+            clip_events = [{"t": contact_tick, "type": "contact"}]
+            for d in in_view(r_deaths):
+                clip_events.append({"t": int(d.tick), "type": "kill",
+                                    "attacker": names.get(d.attacker_steamid, "world"),
+                                    "victim": names.get(d.user_steamid, "?"),
+                                    "attacker_id": pidx.get(d.attacker_steamid), "victim_id": pidx.get(d.user_steamid),
+                                    "weapon": str(d.weapon) if isinstance(d.weapon, str) else "",
+                                    "hs": d.headshot == True,  # noqa: E712 (NaN when missing)
+                                    "by_anchor": d.attacker_steamid == anchor, "anchor_died": d.user_steamid == anchor})
+            for h in in_view(r_hurts):
+                if anchor in (h.attacker_steamid, h.user_steamid):
+                    clip_events.append({"t": int(h.tick), "type": "hurt",
+                                        "attacker": names.get(h.attacker_steamid, "world"),
+                                        "victim": names.get(h.user_steamid, "?"),
+                                        "attacker_id": pidx.get(h.attacker_steamid),
+                                        "victim_id": pidx.get(h.user_steamid),
+                                        "dmg": int(h.dmg_health), "by_anchor": h.attacker_steamid == anchor})
+            for p in in_view(r_plants):
+                clip_events.append({"t": int(p.tick), "type": "plant", "planter": names.get(p.user_steamid, "?"),
+                                    "planter_id": pidx.get(p.user_steamid)})
+            clip_events.sort(key=lambda e: e["t"])
 
             eid = len(engagements)
             reviews.append({
@@ -378,9 +475,8 @@ def analyse(path, site_places):
                 "spot": [num(spot[0]), num(spot[1])],
                 "players": [{"name": names.get(p, p), "team": "CT" if team_of.get(p) == CT_TEAM else "T",
                              "local": p in enemies or p in mates} for p in pids],
-                "frames": frames, "events": events, "notes": notes,
-                "breakdown": [{"label": l, "value": round(v, 2), "detail": d}
-                              for l, v, d in parts if v or l == "Kills vs expected"],
+                "frames": frames, "events": clip_events, "notes": notes,
+                "breakdown": [{"label": l, "value": round(v, 2), "detail": d} for l, v, d in parts],
             })
 
             engagements.append({
@@ -394,44 +490,88 @@ def analyse(path, site_places):
                 "teammates": len(mates),
                 "contact": contact_kind,
                 "kills": kills,
+                "eco_kills": round(eco_kills, 2),
                 "assists": assists,
                 "damage": damage,
                 "survived": survived,
+                "traded": traded,
+                "kast": kast,
+                "swing_pct": round(swing * 100, 1),
                 "time_held_s": round(held, 1),
                 "planted_here": plant_here is not None,
                 "round_won": winner == "CT",
                 "expected_kills": round(expected, 2),
                 "score": round(score, 2),
+                **{f"r_{n}": round(v, 2) for n, v in sub.items()},
             })
 
     viewer = {"map": map_name, "tickrate": TICKRATE, "local_radius": LOCAL_RADIUS,
-              "background": map_background(ticks), "reviews": reviews}
+              "background": map_background(ticks, outline=not radar_files(map_name)), "reviews": reviews}
     return map_name, pd.DataFrame(engagements), viewer
 
 
-def map_background(ticks, cell=48):
-    """Outline the map from everywhere players stood, and label it with nav place names."""
-    cells = set(zip((ticks["X"] // cell).astype(int), (ticks["Y"] // cell).astype(int)))
+# ------------------------------------------------------------------- maps --
+def radar_files(map_name):
+    """(overview .txt, radar .png) for this map from maps/, or None."""
+    txt, png = (os.path.join(MAPS_DIR, os.path.basename(map_name) + ext) for ext in (".txt", ".png"))
+    return (txt, png) if os.path.isfile(txt) and os.path.isfile(png) else None
+
+
+@functools.lru_cache(maxsize=None)
+def radar(map_name, embed=False):
+    """The map's radar calibration and image (a /maps/ URL, or embedded for offline files), or None."""
+    files = radar_files(map_name)
+    if not files:
+        return None
+    with open(files[0], encoding="utf-8", errors="replace") as f:
+        overview = f.read()
+    value = lambda key: float(re.search(rf'"{key}"\s+"([-\d.]+)"', overview).group(1))
+
+    def image(path):
+        if not embed:
+            return "/maps/" + os.path.basename(path)
+        with open(path, "rb") as f:
+            return "data:image/png;base64," + base64.b64encode(f.read()).decode()
+
+    info = {"pos_x": value("pos_x"), "pos_y": value("pos_y"), "scale": value("scale"), "image": image(files[1])}
+    lower = files[1][:-len(".png")] + "_lower.png"
+    split = re.search(r'"lower".*?"AltitudeMax"\s+"([-\d.]+)"', overview, re.S)
+    if os.path.isfile(lower) and split:  # two-level maps like Nuke
+        info["lower"] = {"image": image(lower), "below": float(split.group(1))}
+    return info
+
+
+def map_background(ticks, outline=True, cell=48):
+    """Map bounds and nav place labels, plus an outline traced from where players stood (for maps without a radar)."""
     labels = ticks.groupby("last_place_name")[["X", "Y"]].median()
-    return {
-        "cell": cell,
-        "cells": [[int(x), int(y)] for x, y in cells],
+    background = {
+        "bounds": [num(ticks["X"].min()), num(ticks["Y"].min()), num(ticks["X"].max()), num(ticks["Y"].max())],
         "labels": [{"name": n, "x": num(r.X), "y": num(r.Y)} for n, r in labels.iterrows() if n],
     }
+    if outline:
+        cells = set(zip((ticks["X"] // cell).astype(int), (ticks["Y"] // cell).astype(int)))
+        background.update(cell=cell, cells=[[int(x), int(y)] for x, y in cells])
+    return background
 
 
-def write_viewer(path, viewer, eng, summary):
-    template = os.path.join(os.path.dirname(os.path.abspath(__file__)), "anchor-viewer-template.html")
-    with open(template, encoding="utf-8") as f:
-        html = f.read()
-    keep = set(eng["id"])
+# ----------------------------------------------------------------- output --
+def viewer_data(viewer, eng, summary):
     rows = {r["id"]: r for r in eng.drop(columns="steamid").to_dict("records")}
-    viewer = dict(viewer,
-                  ratings=summary.to_dict("records"),
-                  reviews=[dict(rv, **rows[rv["id"]]) for rv in viewer["reviews"] if rv["id"] in keep])
-    data = json.dumps(viewer, default=lambda o: o.item() if hasattr(o, "item") else str(o))
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(html.replace("__DATA__", data.replace("</", "<\\/")))
+    return dict(viewer,
+                ratings=summary.to_dict("records"),
+                reviews=[dict(rv, **rows[rv["id"]]) for rv in viewer["reviews"] if rv["id"] in rows])
+
+
+def to_json(data):
+    return json.dumps(data, default=lambda o: o.item() if hasattr(o, "item") else str(o))
+
+
+def viewer_html(data=None):
+    """The viewer page; with data embedded it works offline, without it talks to the app server."""
+    if data is not None:
+        data = dict(data, radar=radar(data["map"], embed=True))
+    with open(TEMPLATE, encoding="utf-8") as f:
+        return f.read().replace("__DATA__", to_json(data).replace("</", "<\\/"))
 
 
 def summarise(eng):
@@ -440,79 +580,17 @@ def summarise(eng):
         "engagements": g.size(),
         "kills": g["kills"].sum(),
         "exp_kills": g["expected_kills"].sum().round(2),
-        "avg_enemies": g["enemies"].mean().round(2),
-        "solo_vs_3plus": g.apply(lambda d: ((d.teammates == 0) & (d.enemies >= 3)).sum()),
-        "multi_kills": g.apply(lambda d: (d.kills >= 2).sum()),
-        "zero_kill": g.apply(lambda d: (d.kills == 0).sum()),
-        "adr_on_site": (g["damage"].sum() / g.size()).round(1),
+        "adr_on_site": g["damage"].mean().round(1),
+        "kast_%": (g["kast"].mean() * 100).round(0),
         "survival_%": (g["survived"].mean() * 100).round(0),
-        "avg_time_held": g["time_held_s"].mean().round(1),
-        "site_held_%": (g.apply(lambda d: (~d.planted_here).mean()) * 100).round(0),
-        "impact": g["score"].sum().round(2),
+        "swing_%": g["swing_pct"].mean().round(1),
+        **{column: g[f"r_{n}"].mean().round(2) for n, (_, column, *_) in COMPONENTS.items()},
     })
     summary["anchor_rating"] = (1 + g["score"].mean()).round(2)
     return summary.reset_index().drop(columns="steamid").sort_values("anchor_rating", ascending=False)
 
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-DEMOS_DIR = os.path.join(HERE, "demos")
-OUTPUT_DIR = os.path.join(HERE, "output")
-
-
-def batch(args, site_places):
-    """Process every .dem in demos/ into output/<demo name>/."""
-    demos = sorted(f for f in os.listdir(DEMOS_DIR) if f.lower().endswith(".dem")) if os.path.isdir(DEMOS_DIR) else []
-    if not demos:
-        sys.exit(f"No .dem files found. Put your demos in:\n  {DEMOS_DIR}")
-    done = 0
-    for f in demos:
-        stem = os.path.splitext(f)[0]
-        out_dir = os.path.join(OUTPUT_DIR, stem)
-        viewer = os.path.join(out_dir, "review.html")
-        if os.path.exists(viewer) and not args.force:
-            print(f"Skipping {f} (already done - use --force to redo)")
-            continue
-        print(f"\n### {f}  (parsing, this can take a minute)")
-        os.makedirs(out_dir, exist_ok=True)
-        try:
-            run(os.path.join(DEMOS_DIR, f), site_places, args.player,
-                out=os.path.join(out_dir, "ratings.txt"), viewer_path=viewer,
-                csv=os.path.join(out_dir, "engagements.csv"))
-            done += 1
-        except Exception as e:  # keep going so one bad demo doesn't stop the rest
-            print(f"Failed on {f}: {e}")
-    print(f"\nProcessed {done} demo(s). Results are in:\n  {OUTPUT_DIR}")
-
-
-def main():
-    ap = argparse.ArgumentParser(description="Rate CS2 site anchors from a .dem file.")
-    ap.add_argument("demo", nargs="?",
-                    help="path to the .dem file (leave out to process every demo in the demos/ folder)")
-    ap.add_argument("--player", help="only show this player (name substring)")
-    ap.add_argument("--csv", help="write every engagement to this CSV file")
-    ap.add_argument("--out", help="also write the printed report to this text file")
-    ap.add_argument("--viewer", help="write a 2D replay viewer of every engagement to this .html file")
-    ap.add_argument("--force", action="store_true", help="demos/ mode: redo demos that already have output")
-    ap.add_argument("--extra-places", action="append", default=[],
-                    help='treat extra nav place names as a site, e.g. "BombsiteB:Bench,Market"')
-    args = ap.parse_args()
-
-    site_places = {k: set(v) for k, v in SITE_PLACES.items()}
-    for spec in args.extra_places:
-        site, _, places = spec.partition(":")
-        site = site.replace("Bombsite", "").strip().upper()
-        site_places.setdefault(site, set()).update(p.strip() for p in places.split(",") if p.strip())
-
-    if args.demo is None:
-        batch(args, site_places)
-        return
-    try:
-        run(args.demo, site_places, args.player, args.out, args.viewer, args.csv)
-    except ValueError as e:
-        sys.exit(str(e))
-
-
-def run(demo, site_places, player=None, out=None, viewer_path=None, csv=None):
+def run(demo, site_places, player=None, out=None, viewer_path=None, csv=None, data_path=None):
     map_name, eng, viewer = analyse(demo, {k: set(v) for k, v in site_places.items()})
     if eng.empty:
         raise ValueError("No anchor engagements found. Try --extra-places if the map uses other place names.")
@@ -522,7 +600,7 @@ def run(demo, site_places, player=None, out=None, viewer_path=None, csv=None):
             raise ValueError(f"No anchor engagements for '{player}'.")
 
     cols = ["round", "player", "site", "situation", "contact", "kills", "assists",
-            "damage", "survived", "time_held_s", "planted_here", "round_won", "score"]
+            "damage", "survived", "traded", "swing_pct", "planted_here", "round_won", "score"]
     summary = summarise(eng)
     report = "\n".join([
         f"Map: {map_name}   anchor engagements: {len(eng)}",
@@ -540,13 +618,235 @@ def run(demo, site_places, player=None, out=None, viewer_path=None, csv=None):
             f.write(report + "\n")
         print(f"\nWrote report to {out}")
 
+    data = viewer_data(viewer, eng, summary)
     if viewer_path:
-        write_viewer(viewer_path, viewer, eng, summary)
+        with open(viewer_path, "w", encoding="utf-8") as f:
+            f.write(viewer_html(data))
         print(f"\nWrote 2D review viewer to {viewer_path} - open it in a browser")
+    if data_path:
+        with open(data_path, "w", encoding="utf-8") as f:
+            f.write(to_json(data))
 
     if csv:
         eng.to_csv(csv, index=False)
         print(f"\nWrote {len(eng)} engagements to {csv}")
+    return map_name, len(eng)
+
+
+def process_demo(path, site_places, player=None):
+    """Analyse one demo into output/<demo name>/ and return that name."""
+    stem = os.path.splitext(os.path.basename(path))[0]
+    out_dir = os.path.join(OUTPUT_DIR, stem)
+    os.makedirs(out_dir, exist_ok=True)
+    meta_path = os.path.join(out_dir, "meta.json")
+    if os.path.exists(meta_path):
+        os.remove(meta_path)  # meta.json marks a finished demo; drop it while redoing one
+    map_name, n = run(path, site_places, player, out=os.path.join(out_dir, "ratings.txt"),
+                      csv=os.path.join(out_dir, "engagements.csv"), data_path=os.path.join(out_dir, "data.json"))
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump({"name": stem, "map": map_name, "engagements": n, "processed": time.time()}, f)
+    return stem
+
+
+def pending_demos(force=False):
+    """Demos in demos/ that have no finished output yet (or all of them with force)."""
+    if not os.path.isdir(DEMOS_DIR):
+        return []
+    return [os.path.join(DEMOS_DIR, f) for f in sorted(os.listdir(DEMOS_DIR))
+            if f.lower().endswith(".dem")
+            and (force or not os.path.exists(os.path.join(OUTPUT_DIR, os.path.splitext(f)[0], "meta.json")))]
+
+
+def batch(args, site_places):
+    """Process every .dem in demos/ into output/<demo name>/."""
+    demos = pending_demos(args.force)
+    if not demos:
+        sys.exit(f"No new .dem files found in:\n  {DEMOS_DIR}\n(use --force to redo finished ones)")
+    done = 0
+    for path in demos:
+        print(f"\n### {os.path.basename(path)}")
+        try:
+            process_demo(path, site_places, args.player)
+            done += 1
+        except Exception as e:  # keep going so one bad demo doesn't stop the rest
+            print(f"Failed on {os.path.basename(path)}: {e}")
+    print(f"\nProcessed {done} demo(s). Results are in:\n  {OUTPUT_DIR}\nRun without --batch to review them.")
+
+
+# ------------------------------------------------------------------ server --
+JOBS = {}                  # job id -> {"id", "name", "status", "message", "demo"}
+JOB_QUEUE = queue.Queue()  # demos are parsed one at a time; parsing is memory hungry
+
+
+def queue_job(path):
+    job = {"id": uuid.uuid4().hex[:8], "name": os.path.basename(path), "status": "queued", "message": "", "demo": None}
+    JOBS[job["id"]] = job
+    JOB_QUEUE.put((job, path))
+    return job
+
+
+def worker(site_places):
+    while True:
+        job, path = JOB_QUEUE.get()
+        job["status"] = "parsing"
+        print(f"\n### {job['name']}")
+        try:
+            job["demo"] = process_demo(path, site_places)
+            job["status"] = "done"
+        except ValueError as e:
+            job.update(status="error", message=str(e))
+        except Exception as e:  # report it in the viewer and keep serving
+            job.update(status="error", message=f"Couldn't read this demo - is it a complete CS2 .dem file? ({e})")
+        if job["status"] == "error":
+            print(f"Failed on {job['name']}: {job['message']}")
+
+
+def list_demos():
+    demos = []
+    for d in os.listdir(OUTPUT_DIR) if os.path.isdir(OUTPUT_DIR) else []:
+        try:
+            with open(os.path.join(OUTPUT_DIR, d, "meta.json"), encoding="utf-8") as f:
+                demos.append(json.load(f))
+        except (OSError, ValueError):
+            continue
+    return sorted(demos, key=lambda m: m.get("processed", 0), reverse=True)
+
+
+def load_demo(name):
+    """A processed demo's viewer data, or None for anything that isn't one."""
+    path = os.path.join(OUTPUT_DIR, name, "data.json")
+    if name != os.path.basename(name) or name in ("", ".", "..") or not os.path.isfile(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+class App(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def reply(self, code, body, ctype="application/json", headers=()):
+        if not isinstance(body, (str, bytes)):
+            body = to_json(body)
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        for header in headers:
+            self.send_header(*header)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        path = unquote(urlparse(self.path).path)
+        if path == "/":
+            return self.reply(200, viewer_html(), "text/html; charset=utf-8")
+        if path == "/api/demos":
+            return self.reply(200, list_demos())
+        if path == "/api/jobs":
+            return self.reply(200, list(JOBS.values()))
+        if path.startswith("/maps/"):
+            file = os.path.join(MAPS_DIR, os.path.basename(path))
+            if file.endswith(".png") and os.path.isfile(file):
+                with open(file, "rb") as f:
+                    return self.reply(200, f.read(), "image/png")
+        if path.startswith("/api/demos/"):
+            name, _, action = path[len("/api/demos/"):].partition("/")
+            data = load_demo(name)
+            if data is not None and action == "":
+                return self.reply(200, dict(data, radar=radar(data["map"])))
+            if data is not None and action == "export":  # standalone copy that works offline
+                return self.reply(200, viewer_html(data), "text/html; charset=utf-8",
+                                  [("Content-Disposition", f'attachment; filename="{name}.html"')])
+        self.reply(404, {"error": "Not found."})
+
+    def do_POST(self):
+        url = urlparse(self.path)
+        if url.path != "/api/upload":
+            return self.reply(404, {"error": "Not found."})
+        name = re.sub(r"[^\w.\- ]", "_", os.path.basename(parse_qs(url.query).get("name", [""])[0]))
+        if not name.lower().endswith(".dem") or name.startswith("."):
+            return self.reply(400, {"error": "Only .dem files can be uploaded."})
+        if any(j["name"] == name and j["status"] in ("queued", "parsing") for j in list(JOBS.values())):
+            return self.reply(409, {"error": f"{name} is already being processed."})
+        remaining = int(self.headers.get("Content-Length") or 0)
+        if not remaining:
+            return self.reply(400, {"error": "The file is empty."})
+
+        os.makedirs(DEMOS_DIR, exist_ok=True)
+        dest = os.path.join(DEMOS_DIR, name)
+        part = dest + ".part"
+        with open(part, "wb") as f:
+            while remaining:
+                chunk = self.rfile.read(min(1 << 20, remaining))
+                if not chunk:
+                    break
+                f.write(chunk)
+                remaining -= len(chunk)
+        if remaining:
+            os.remove(part)
+            return self.reply(400, {"error": "The upload was cut off."})
+        os.replace(part, dest)
+        self.reply(200, queue_job(dest))
+
+
+def serve(site_places, port, browser=True):
+    threading.Thread(target=worker, args=(site_places,), daemon=True).start()
+    for path in pending_demos():  # demos dropped into demos/ by hand still get picked up
+        queue_job(path)
+
+    for p in range(port, port + 20):
+        try:
+            server = ThreadingHTTPServer(("127.0.0.1", p), App)
+            break
+        except OSError:
+            continue
+    else:
+        sys.exit(f"Couldn't find a free port from {port} to {port + 19}.")
+    url = f"http://127.0.0.1:{server.server_port}/"
+    print(f"Anchor Review is running at {url}\nUpload demos in the browser. Press Ctrl+C (or close this window) to stop.")
+    if browser:
+        webbrowser.open(url)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Rate CS2 site anchors from a .dem file.")
+    ap.add_argument("demo", nargs="?",
+                    help="path to the .dem file (leave out to open the viewer app and upload demos there)")
+    ap.add_argument("--batch", action="store_true",
+                    help="process every new demo in the demos/ folder without opening the viewer")
+    ap.add_argument("--force", action="store_true", help="--batch: also redo demos that already have output")
+    ap.add_argument("--port", type=int, default=8765, help="viewer app port (default 8765)")
+    ap.add_argument("--no-browser", action="store_true", help="start the viewer app without opening a browser")
+    ap.add_argument("--player", help="only show this player (name substring)")
+    ap.add_argument("--csv", help="write every engagement to this CSV file")
+    ap.add_argument("--out", help="also write the printed report to this text file")
+    ap.add_argument("--viewer", help="write a standalone 2D replay viewer of every engagement to this .html file")
+    ap.add_argument("--extra-places", action="append", default=[],
+                    help='treat extra nav place names as a site, e.g. "BombsiteB:Bench,Market"')
+    args = ap.parse_args()
+
+    site_places = {k: set(v) for k, v in SITE_PLACES.items()}
+    for spec in args.extra_places:
+        site, _, places = spec.partition(":")
+        site = site.replace("Bombsite", "").strip().upper()
+        site_places.setdefault(site, set()).update(p.strip() for p in places.split(",") if p.strip())
+
+    if args.demo:
+        try:
+            run(args.demo, site_places, args.player, args.out, args.viewer, args.csv)
+        except ValueError as e:
+            sys.exit(str(e))
+    elif args.batch:
+        batch(args, site_places)
+    else:
+        serve(site_places, args.port, not args.no_browser)
 
 
 if __name__ == "__main__":

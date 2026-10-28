@@ -1,5 +1,5 @@
 #!/usr/bin/env sh
-# Rate every demo in the demos folder.
+# Open Anchor Review in your browser and upload demos there.
 cd "$(dirname "$0")" || exit 1
 if [ ! -x .venv/bin/python ]; then
     echo "First run: setting up Python environment..."

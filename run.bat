@@ -1,5 +1,5 @@
 @echo off
-rem Double-click to rate every demo in the demos folder.
+rem Double-click to open Anchor Review in your browser and upload demos there.
 cd /d "%~dp0"
 
 where python >nul 2>nul
@@ -17,8 +17,8 @@ if not exist ".venv\Scripts\python.exe" (
     ".venv\Scripts\python.exe" -m pip install -r requirements.txt || goto :fail
 )
 
+rem Opens the viewer in your browser; keep this window open while you use it.
 ".venv\Scripts\python.exe" anchor-stats.py %*
-if exist output start "" "output"
 pause
 exit /b 0
 
