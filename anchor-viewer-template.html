@@ -88,6 +88,7 @@
   .lib select { flex: 1; min-width: 0; background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; }
   .btn { background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 5px 10px; cursor: pointer; }
   .btn:hover { border-color: var(--accent); }
+  .btn:disabled { opacity: .5; cursor: not-allowed; }
   a.btn { color: inherit; text-decoration: none; text-align: center; font-size: 12.5px; }
   .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--bg); font-weight: 600; }
   .jobs { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; font-size: 12.5px; }
@@ -524,7 +525,8 @@ const uploads = new Map();    // local id -> { name, pct }
 const notices = [];           // client-side errors, e.g. a rejected upload
 const dismissed = new Set();  // server job ids whose error was closed
 const opened = new Set();     // finished job ids already acted on
-let jobs = [], wanted = new Set(), demos = [], uploadSeq = 0;
+let jobs = [], wanted = new Set(), demos = [], uploadSeq = 0, offline = false;
+const OFFLINE = "Can't reach Anchor Review. Start run.bat again (keep its window open), then upload again.";
 
 async function getJSON(url) {
   const r = await fetch(url);
@@ -554,6 +556,8 @@ async function openDemo(name) {
 
 function renderJobs() {
   const items = [];
+  if (offline) items.push(`<li class="err"><div class="st"><span>${OFFLINE}</span></div></li>`);
+  $('uploadBtn').disabled = offline;
   for (const u of uploads.values())
     items.push(`<li><div class="nm">${esc(u.name)}</div><div class="st"><span>Uploading</span><span>${u.pct}%</span></div>
       <div class="prog"><i style="width:${u.pct}%"></i></div></li>`);
@@ -578,9 +582,12 @@ async function pollJobs() {
     const finished = jobs.filter(j => j.status === 'done' && !opened.has(j.id));
     finished.forEach(j => opened.add(j.id));
     const mine = finished.filter(j => wanted.has(j.id)).pop();
-    if (finished.length) await refreshDemos(mine ? mine.demo : null);
+    if (finished.length || offline) await refreshDemos(mine ? mine.demo : null);
+    offline = false;
     renderJobs();
-  } catch (e) { /* server restarting or closed; try again shortly */ }
+  } catch (e) {  // the app was closed or restarted; keep checking so the page recovers when it's back
+    if (!offline) { offline = true; renderJobs(); }
+  }
   setTimeout(pollJobs, 1500);
 }
 
@@ -599,7 +606,8 @@ function upload(file) {
     let res = {};
     try { res = JSON.parse(xhr.responseText); } catch (e) {}
     if (xhr.status === 200) { wanted.add(res.id); jobs.push(res); }
-    else notices.push(res.error || `Uploading ${file.name} failed.`);
+    else if (xhr.status === 0) { offline = true; notices.push(`Uploading ${file.name} failed: the app isn't running.`); }
+    else notices.push(res.error || `Uploading ${file.name} failed (error ${xhr.status}).`);
     renderJobs();
   };
   xhr.send(file);
