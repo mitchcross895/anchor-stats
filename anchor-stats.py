@@ -20,8 +20,8 @@ How it works
 2. Engagement ("local area"): the engagement starts at the first damage
    exchanged between the anchor and a T while the anchor is still near their
    spot, or, if there was never any contact, at a bomb plant on their site.
-   Ts and CTs within LOCAL_RADIUS units of the anchor around that moment are
-   counted, which gives the situation (1v4, 2v3, ...).
+   Ts and CTs within LOCAL_RADIUS units of the anchor (MAP_LOCAL_RADIUS per
+   map) around that moment are counted, which gives the situation (1v4, 2v3, ...).
 
 3. Score, modelled on HLTV Rating 3.0: each fight gets six sub-ratings where
    1.00 is an average anchor fight in that situation:
@@ -67,6 +67,10 @@ SETUP_END = 20                # seconds after freeze end to stop judging setups
 SETUP_MIN_SHARE = 0.6         # share of setup samples that must be on the site
 ANCHOR_LEASH = 1500           # units the anchor may stray from their spot and still count
 LOCAL_RADIUS = 1000           # units around the anchor that count as "local" (the viewer's dashed circle)
+MAP_LOCAL_RADIUS = {          # per-map override: tight sites get a smaller circle, open ones a larger one
+    "de_nuke": 750, "de_inferno": 850, "de_anubis": 900, "de_ancient": 950,
+    "de_cache": 1000, "de_mirage": 1050, "de_dust2": 1250,
+}
 LOCAL_WINDOW_BEFORE = 3       # seconds before contact to count local players
 LOCAL_WINDOW_AFTER = 8        # seconds after contact to count local players
 PRE_ROLL = 5                  # viewer: seconds shown before contact
@@ -277,6 +281,7 @@ def get_rounds(events):
 def analyse(path, site_places):
     parser = DemoParser(path)
     map_name = os.path.basename(parser.parse_header().get("map_name", "unknown"))
+    radius = MAP_LOCAL_RADIUS.get(map_name, LOCAL_RADIUS)
     for site, extra in MAP_EXTRA_PLACES.get(map_name, {}).items():
         site_places.setdefault(site, set()).update(extra)
 
@@ -385,7 +390,7 @@ def analyse(path, site_places):
                 seen = idx >= 0  # samples before the anchor's first one have no anchor position
                 near, idx = near[seen], idx[seen]
                 gap = ((near[["X", "Y", "Z"]].to_numpy() - a_xyz[idx]) ** 2).sum(axis=1) ** 0.5
-                near = near[(gap <= LOCAL_RADIUS) | (near["site"] == site).to_numpy()]
+                near = near[(gap <= radius) | (near["site"] == site).to_numpy()]
             else:
                 near = near.iloc[0:0]
             enemies = set(near.loc[near["team_num"] == T_TEAM, "steamid"])
@@ -581,7 +586,7 @@ def analyse(path, site_places):
                 **{f"r_{n}": round(v, 2) for n, v in sub.items()},
             })
 
-    viewer = {"map": map_name, "tickrate": TICKRATE, "local_radius": LOCAL_RADIUS,
+    viewer = {"map": map_name, "tickrate": TICKRATE, "local_radius": radius,
               "background": map_background(ticks, outline=not radar_files(map_name)), "reviews": reviews}
     return map_name, pd.DataFrame(engagements), viewer
 
