@@ -636,11 +636,14 @@ def map_background(ticks, outline=True, cell=48):
 
 
 # ----------------------------------------------------------------- output --
-def viewer_data(viewer, eng, summary):
+def viewer_data(viewer, eng):
     rows = {r["id"]: r for r in eng.drop(columns="steamid").to_dict("records")}
-    return dict(viewer,
-                ratings=summary.to_dict("records"),
-                reviews=[dict(rv, **rows[rv["id"]]) for rv in viewer["reviews"] if rv["id"] in rows])
+    return dict(viewer, reviews=[dict(rv, **rows[rv["id"]]) for rv in viewer["reviews"] if rv["id"] in rows])
+
+
+def engagement_key(round_no, player):
+    """Names an engagement across reprocessing (ids can shift; an anchor holds one site a round)."""
+    return f"{int(round_no)}:{player}"
 
 
 def to_json(data):
@@ -656,6 +659,7 @@ def viewer_html(data=None):
 
 
 def summarise(eng):
+    eng = eng[~eng["excluded"]]
     g = eng.groupby(["steamid", "player"])
     summary = pd.DataFrame({
         "engagements": g.size(),
@@ -671,20 +675,28 @@ def summarise(eng):
     return summary.reset_index().drop(columns="steamid").sort_values("anchor_rating", ascending=False)
 
 
-def run(demo, site_places, player=None, out=None, viewer_path=None, csv=None, data_path=None):
+def run(demo, site_places, player=None, out=None, viewer_path=None, csv=None, data_path=None, excluded=()):
     map_name, eng, viewer = analyse(demo, {k: set(v) for k, v in site_places.items()})
     if eng.empty:
         raise ValueError("No anchor engagements found. Try --extra-places if the map uses other place names.")
     if player:
-        eng = eng[eng["player"].str.contains(player, case=False)]
+        eng = eng[eng["player"].str.contains(player, case=False)].copy()
         if eng.empty:
             raise ValueError(f"No anchor engagements for '{player}'.")
+    eng["excluded"] = [engagement_key(r, p) in excluded for r, p in zip(eng["round"], eng["player"])]
+    write_results(map_name, eng, viewer_data(viewer, eng), out, viewer_path, csv, data_path)
+    return map_name, len(eng)
 
+
+def write_results(map_name, eng, data, out=None, viewer_path=None, csv=None, data_path=None, quiet=False):
+    """Rate the engagements that aren't excluded, then write the report, viewer data and CSV."""
+    say = (lambda *a: None) if quiet else print
     cols = ["round", "player", "site", "situation", "contact", "kills", "assists",
-            "damage", "survived", "traded", "swing_pct", "planted_here", "round_won", "score"]
+            "damage", "survived", "traded", "swing_pct", "planted_here", "round_won", "score", "excluded"]
     summary = summarise(eng)
+    n_out = int(eng["excluded"].sum())
     report = "\n".join([
-        f"Map: {map_name}   anchor engagements: {len(eng)}",
+        f"Map: {map_name}   anchor engagements: {len(eng)}" + (f" ({n_out} excluded from the ratings)" if n_out else ""),
         "",
         "=== Anchor ratings ===",
         summary.to_string(index=False),
@@ -692,26 +704,30 @@ def run(demo, site_places, player=None, out=None, viewer_path=None, csv=None, da
         "=== Engagements ===",
         eng[cols].to_string(index=False),
     ])
-    print("\n" + report)
+    say("\n" + report)
 
     if out:
         with open(out, "w", encoding="utf-8") as f:
             f.write(report + "\n")
-        print(f"\nWrote report to {out}")
+        say(f"\nWrote report to {out}")
 
-    data = viewer_data(viewer, eng, summary)
+    data["ratings"] = summary.to_dict("records")
+    excluded = dict(zip(eng["id"], eng["excluded"]))
+    for rv in data["reviews"]:
+        rv["excluded"] = bool(excluded.get(rv["id"], False))
     if viewer_path:
         with open(viewer_path, "w", encoding="utf-8") as f:
             f.write(viewer_html(data))
-        print(f"\nWrote 2D review viewer to {viewer_path} - open it in a browser")
+        say(f"\nWrote 2D review viewer to {viewer_path} - open it in a browser")
     if data_path:
-        with open(data_path, "w", encoding="utf-8") as f:
+        with open(data_path + ".tmp", "w", encoding="utf-8") as f:
             f.write(to_json(data))
+        os.replace(data_path + ".tmp", data_path)  # the app may be reading it
 
     if csv:
         eng.to_csv(csv, index=False)
-        print(f"\nWrote {len(eng)} engagements to {csv}")
-    return map_name, len(eng)
+        say(f"\nWrote {len(eng)} engagements to {csv}")
+    return data
 
 
 def process_demo(path, site_places, player=None):
@@ -723,10 +739,45 @@ def process_demo(path, site_places, player=None):
     if os.path.exists(meta_path):
         os.remove(meta_path)  # meta.json marks a finished demo; drop it while redoing one
     map_name, n = run(path, site_places, player, out=os.path.join(out_dir, "ratings.txt"),
-                      csv=os.path.join(out_dir, "engagements.csv"), data_path=os.path.join(out_dir, "data.json"))
+                      csv=os.path.join(out_dir, "engagements.csv"), data_path=os.path.join(out_dir, "data.json"),
+                      excluded=read_excluded(out_dir))
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump({"name": stem, "map": map_name, "engagements": n, "processed": time.time()}, f)
     return stem
+
+
+def read_excluded(out_dir):
+    """Engagements taken out of the ratings in the viewer; they stay out when the demo is reprocessed."""
+    try:
+        with open(os.path.join(out_dir, "excluded.json"), encoding="utf-8") as f:
+            return set(json.load(f))
+    except (OSError, ValueError):
+        return set()
+
+
+EXCLUDE_LOCK = threading.Lock()
+
+
+def set_excluded(name, review_id, exclude):
+    """Take an engagement out of (or back into) a processed demo's ratings; returns the new viewer data."""
+    data = load_demo(name)
+    if data is None:
+        return None
+    out_dir = os.path.join(OUTPUT_DIR, name)
+    with EXCLUDE_LOCK:
+        eng = pd.read_csv(os.path.join(out_dir, "engagements.csv"))
+        row = eng[eng["id"] == review_id]
+        if row.empty:
+            return None
+        keys = read_excluded(out_dir)
+        key = engagement_key(row["round"].iloc[0], row["player"].iloc[0])
+        (keys.add if exclude else keys.discard)(key)
+        with open(os.path.join(out_dir, "excluded.json"), "w", encoding="utf-8") as f:
+            json.dump(sorted(keys), f)
+        eng["excluded"] = [engagement_key(r, p) in keys for r, p in zip(eng["round"], eng["player"])]
+        return write_results(data["map"], eng, data, out=os.path.join(out_dir, "ratings.txt"),
+                             csv=os.path.join(out_dir, "engagements.csv"),
+                             data_path=os.path.join(out_dir, "data.json"), quiet=True)
 
 
 def pending_demos(force=False):
@@ -845,6 +896,17 @@ class App(BaseHTTPRequestHandler):
 
     def do_POST(self):
         url = urlparse(self.path)
+        m = re.fullmatch(r"/api/demos/([^/]+)/exclude", unquote(url.path))
+        if m:
+            try:
+                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+                data = set_excluded(m.group(1), int(body["id"]), bool(body["excluded"]))
+            except (ValueError, KeyError, TypeError):
+                return self.reply(400, {"error": "Bad request."})
+            if data is None:
+                return self.reply(404, {"error": "Not found."})
+            return self.reply(200, {"ratings": data["ratings"],
+                                    "excluded": [rv["id"] for rv in data["reviews"] if rv["excluded"]]})
         if url.path != "/api/upload":
             return self.reply(404, {"error": "Not found."})
         name = re.sub(r"[^\w.\- ]", "_", os.path.basename(parse_qs(url.query).get("name", [""])[0]))

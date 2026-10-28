@@ -41,6 +41,8 @@
   .list .who { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .list .meta { grid-column: 2; color: var(--muted); font-size: 12px; }
   .list .sc { grid-row: 1 / span 2; grid-column: 3; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .list li.out .who, .list li.out .sc { text-decoration: line-through; color: var(--muted); }
+  .list li.out .meta::after { content: ' · excluded'; color: var(--bad); }
   .pos { color: var(--good); } .neg { color: var(--bad); }
 
   main { display: flex; flex-direction: column; min-width: 0; }
@@ -71,6 +73,9 @@
   .badge { background: var(--panel-2); border: 1px solid var(--line); border-radius: 999px; padding: 1px 9px; font-size: 12px; }
   .big { font-size: 30px; font-weight: 800; font-variant-numeric: tabular-nums; line-height: 1; text-align: right; }
   .big small { display: block; font-size: 11px; font-weight: 500; color: var(--muted); margin-top: 4px; }
+  .excl { display: flex; align-items: center; gap: 10px; margin-top: 12px; font-size: 12.5px; }
+  .excl.out { background: color-mix(in srgb, var(--bad) 12%, transparent); border: 1px solid var(--bad);
+              border-radius: 6px; padding: 8px 10px; }
   .why { margin: 0; padding-left: 18px; }
   .why li { margin-bottom: 6px; }
   .bd td { padding: 6px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
@@ -500,7 +505,8 @@ function renderRatings() {
 }
 function visible() { return D.reviews.filter(r => !filter || r.player === filter); }
 function renderList() {
-  $('list').innerHTML = visible().map(r => `<li data-id="${r.id}" class="${R && R.id === r.id ? 'on' : ''}">
+  $('list').innerHTML = visible().map(r => `<li data-id="${r.id}" class="${R && R.id === r.id ? 'on' : ''} ${r.excluded ? 'out' : ''}"
+      title="${r.excluded ? 'Excluded from the rating' : ''}">
       <span class="r">R${r.round}</span><span class="who">${esc(shortName(r.player))}</span>
       <span class="sc ${cls(r.score)}">${fmt(r.score)}</span>
       <span class="meta">${r.site} · ${r.situation} · ${r.kills}K${r.contact === 'no contact' ? ' · no contact' : ''}</span></li>`).join('');
@@ -533,6 +539,10 @@ function renderNotes() {
           <span class="badge">${R.situation}</span><span class="badge">${R.round_won ? 'CT win' : 'T win'}</span></div></div>
       <div class="big ${cls(R.score)}">${fmt(R.score)}<small>vs average anchor</small></div>
     </div>
+    <div class="excl ${R.excluded ? 'out' : ''}">
+      ${R.excluded ? `<span>Excluded: this fight doesn't count towards ${esc(shortName(R.player))}'s rating.</span>` : ''}
+      ${D.name ? `<button class="btn" id="exclBtn">${R.excluded ? 'Include in rating' : 'Exclude from rating'}</button>` : ''}
+    </div>
     <h2>Why this score</h2>
     <ul class="why">${R.notes.map(n => `<li>${esc(n)}</li>`).join('')}</ul>
     <h2>Score breakdown</h2>
@@ -543,6 +553,7 @@ function renderNotes() {
     <ul class="feed" id="feed">${R.feed.map((e, i) => `<li data-i="${i}" class="${e.type === 'util' ? 'util' : ''}"><span class="tm">${rel(e.t)}</span><span>${eventText(e)}</span></li>`).join('')}</ul>
     <p class="hint" style="margin-top:16px">HLTV 3.0-style: six sub-ratings (1.00 = average anchor fight) weighted into the fight score. Rating = 1.00 + average fight score.</p>`;
   $('feed').querySelectorAll('li').forEach(li => li.onclick = () => { seek(R.feed[+li.dataset.i].t - 2 * TR); });
+  if ($('exclBtn')) $('exclBtn').onclick = () => setExcluded(R, !R.excluded);
   updateFeed(true);
 }
 let feedPast = -1;
@@ -680,6 +691,23 @@ async function openDemo(name) {
     $('exportBtn').href = `/api/demos/${encodeURIComponent(name)}/export`;
     $('exportBtn').hidden = false;
   } catch (e) { notices.push(`Couldn't open ${name}: ${e.message}`); renderJobs(); }
+}
+
+// take an engagement out of the ratings (or put it back); the app recalculates them and saves the choice
+async function setExcluded(rv, excluded) {
+  $('exclBtn').disabled = true;
+  try {
+    const r = await fetch(`/api/demos/${encodeURIComponent(D.name)}/exclude`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: rv.id, excluded }) });
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.statusText);
+    const res = await r.json(), out = new Set(res.excluded);
+    D.ratings = res.ratings;
+    for (const x of D.reviews) x.excluded = out.has(x.id);
+  } catch (e) {
+    notices.push(`Couldn't update the rating: ${e.message === 'Failed to fetch' ? OFFLINE : e.message}`); renderJobs();
+  }
+  renderRatings(); renderList();
+  if (R === rv) renderNotes();
 }
 
 function renderJobs() {

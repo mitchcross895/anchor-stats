@@ -18,6 +18,7 @@ output/
     ratings.txt       text report
     engagements.csv   one row per anchor fight, for spreadsheets
     data.json         what the viewer shows (meta.json marks the demo as finished)
+    excluded.json     fights you took out of the ratings in the viewer (only if you did)
 ```
 
 ## Mac / Linux
@@ -53,6 +54,8 @@ Utility is shown too:
 - **The event list** says who each flash blinded and for how long, highlighted when it caught the anchor.
 
 Press **U**, or click **Utility**, to hide it. Utility is display-only and doesn't affect the rating.
+
+To leave a fight out of the ratings (a misread anchor, a bugged round, ...), select it and click **Exclude from rating**. The ratings, `ratings.txt` and `engagements.csv` update straight away. The fight stays in the list, struck through, and **Include in rating** puts it back. Exclusions are saved in the demo's `excluded.json`, so they stay put if the demo is reprocessed.
 
 To share a review, open it and click **Download offline copy**. That gives you a single `.html` file that works without the app, radar included.
 
