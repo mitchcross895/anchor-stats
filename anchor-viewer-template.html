@@ -416,8 +416,8 @@ function render() {
     ctx.fillStyle = col; ctx.globalAlpha *= 0.18;
     ctx.beginPath(); ctx.moveTo(x, y); ctx.arc(x, y, cone, -a - half, -a + half); ctx.closePath(); ctx.fill();
     ctx.globalAlpha /= 0.18;
-    ctx.strokeStyle = col; ctx.lineWidth = 2.5; ctx.lineCap = 'round';
-    ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + Math.cos(a) * (r + 26), y - Math.sin(a) * (r + 26)); ctx.stroke();
+    ctx.strokeStyle = col; ctx.lineWidth = 4.5; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + Math.cos(a) * (r + 11), y - Math.sin(a) * (r + 11)); ctx.stroke();
     ctx.lineCap = 'butt';
     ctx.fillStyle = col; ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
     if (isA) { ctx.strokeStyle = C.anchor; ctx.lineWidth = 2.5; ctx.beginPath(); ctx.arc(x, y, r + 3, 0, Math.PI * 2); ctx.stroke(); }
