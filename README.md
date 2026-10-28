@@ -46,6 +46,14 @@ The viewer app only listens on this computer (`127.0.0.1`), so nobody else on yo
 
 The viewer draws the real radar for the Premier maps: Inferno, Mirage, Dust 2, Cache, Nuke, Anubis and Ancient. On Nuke, it follows the anchor between the upper and lower levels; use the **Level** button to pick one yourself. Any other map falls back to an outline traced from where players stood. See [maps/README.md](maps/README.md) to add more maps.
 
+Utility is shown too:
+- **Grenades in flight** leave a trail in the thrower's team colour.
+- **Smokes and molotovs** show as clouds and fire patches for as long as they last.
+- **Flashes and HE grenades** show a quick burst.
+- **The event list** says who each flash blinded and for how long, highlighted when it caught the anchor.
+
+Press **U**, or click **Utility**, to hide it. Utility is display-only and doesn't affect the rating.
+
 To share a review, open it and click **Download offline copy**. That gives you a single `.html` file that works without the app, radar included.
 
 ## How the rating works

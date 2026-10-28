@@ -10,6 +10,7 @@
     --text: #e6e9ee; --muted: #8b94a3; --map: #2b323c; --map-label: #5d6775;
     --ct: #5aa9ff; --t: #f0a03c; --anchor: #ffffff; --good: #4fd18b; --bad: #ff6b6b;
     --contact: #ffd84d; --accent: #8fb8ff;
+    --smoke: #d5dbe3; --fire: #ff7a29; --flash: #fff6c2; --he: #ff4d4d; --decoy: #7ee787;
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; height: 100%; }
@@ -81,6 +82,9 @@
   .feed li.past { color: var(--text); }
   .feed li:hover { background: var(--panel-2); }
   .feed .tm { font-variant-numeric: tabular-nums; min-width: 44px; }
+  .feed.no-util li.util { display: none; }
+  .feed .dot { margin-right: 4px; }
+  body.no-util .util-key { display: none; }
 
   .lib { padding: 0 16px 4px; display: flex; flex-direction: column; gap: 8px; }
   .lib[hidden] { display: none; }
@@ -145,6 +149,10 @@
         <span><span class="dot" style="background:var(--t)"></span>T</span>
         <span><span class="dot" style="background:var(--anchor)"></span>Anchor</span>
         <span>dashed ring = local area</span>
+        <span class="util-key"><span class="dot" style="background:var(--smoke)"></span>smoke
+          <span class="dot" style="background:var(--fire);margin-left:6px"></span>fire
+          <span class="dot" style="background:var(--flash);margin-left:6px"></span>flash
+          <span class="dot" style="background:var(--he);margin-left:6px"></span>HE</span>
       </div>
       <div class="empty" id="empty" hidden>
         <div>
@@ -171,8 +179,9 @@
         <button id="fit">Fit map</button>
         <button id="focus">Focus fight</button>
         <button id="level" title="Which level of the map to show" hidden>Level: auto</button>
+        <button id="util" title="Show grenades (U)">Utility: on</button>
         <span class="spacer"></span>
-        <span class="hint">space play &middot; &larr;/&rarr; 1s &middot; [ ] fight &middot; scroll zoom &middot; drag pan</span>
+        <span class="hint">space play &middot; &larr;/&rarr; 1s &middot; [ ] fight &middot; U utility &middot; scroll zoom &middot; drag pan</span>
       </div>
     </div>
   </main>
@@ -188,7 +197,8 @@ try { EMBEDDED = JSON.parse(document.getElementById('data').textContent); } catc
 let D = null, TR = 64;
 const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 const C = {};
-['--map','--map-label','--ct','--t','--anchor','--good','--bad','--contact','--muted','--text','--bg'].forEach(k => C[k.slice(2)] = css(k));
+['--map','--map-label','--ct','--t','--anchor','--good','--bad','--contact','--muted','--text','--bg',
+ '--smoke','--fire','--flash','--he','--decoy'].forEach(k => C[k.slice(2)] = css(k));
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const fmt = v => (v > 0 ? '+' : '') + v.toFixed(2);
@@ -197,6 +207,15 @@ const cls = v => v > 0 ? 'pos' : v < 0 ? 'neg' : '';
 // ---------- load a demo's data
 let B = null, cell = 1, minX = 0, maxX = 1, minY = 0, maxY = 1;
 let radar = { upper: null, lower: null }, level = 'auto';  // level: auto | upper | lower (two-level maps)
+let showUtil = true;
+// grenade look: colour var, effect radius in world units, seconds a burst stays visible
+const UTIL = {
+  smoke: { col: 'smoke', r: 144, name: 'smoke' },
+  molotov: { col: 'fire', r: 150, name: 'molotov' },
+  flash: { col: 'flash', r: 220, name: 'flash', burst: 0.5 },
+  he: { col: 'he', r: 350, name: 'HE grenade', burst: 0.6 },
+  decoy: { col: 'decoy', r: 50, name: 'decoy' },
+};
 function load(data) {
   D = data; TR = D.tickrate;
   B = D.background; cell = B.cell || 1;
@@ -209,6 +228,10 @@ function load(data) {
       e.apos = lastPos(R, e.attacker_id ?? e.planter_id, e.t);
       e.vpos = lastPos(R, e.victim_id, e.t);
     }
+    R.utility = R.utility || [];
+    // the events list: kills, hits and the plant, plus every grenade that goes off in the clip
+    R.feed = R.events.concat(R.utility.filter(u => u.td >= R.start && u.td <= R.end)
+      .map(u => ({ t: u.td, type: 'util', u }))).sort((a, b) => a.t - b.t);
   }
   radar = { upper: null, lower: null };
   const img = src => { const i = new Image(); i.onload = draw; i.src = src; return i; };
@@ -334,6 +357,8 @@ function draw() {
   ctx.beginPath(); ctx.arc(sx(ringAt.x), sy(ringAt.y), D.local_radius * view.s, 0, Math.PI * 2); ctx.stroke();
   ctx.restore();
 
+  if (showUtil) drawUtility();
+
   // events: death markers, shot lines, bomb
   for (const e of R.events) {
     if (e.t > cur) continue;
@@ -372,6 +397,47 @@ function draw() {
   }
 }
 const shortName = n => n.includes('|') ? n.split('|').pop().trim() : n;
+
+// grenades: a trail while in the air, then the effect where it landed
+function drawUtility() {
+  for (const u of R.utility) {
+    const look = UTIL[u.kind];
+    if (!look || cur < u.t0 || cur > u.te + (look.burst || 0) * TR) continue;
+    const col = C[look.col];
+    if (cur < u.td) {
+      // in flight: path so far, in the thrower's team colour, and the grenade itself
+      const pts = u.path.filter(p => p[0] <= cur);
+      const nx = u.path.find(p => p[0] > cur);
+      let head = pts[pts.length - 1];
+      if (head && nx) { const k = (cur - head[0]) / (nx[0] - head[0]); head = [cur, head[1] + (nx[1] - head[1]) * k, head[2] + (nx[2] - head[2]) * k]; }
+      if (!head) continue;
+      ctx.globalAlpha = .7; ctx.strokeStyle = u.team === 'CT' ? C.ct : C.t; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(sx(pts[0][1]), sy(pts[0][2]));
+      for (const p of pts.slice(1)) ctx.lineTo(sx(p[1]), sy(p[2]));
+      ctx.lineTo(sx(head[1]), sy(head[2])); ctx.stroke();
+      ctx.globalAlpha = 1; ctx.fillStyle = col; ctx.strokeStyle = C.bg; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.arc(sx(head[1]), sy(head[2]), 3.5, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+      continue;
+    }
+    const x = sx(u.x), y = sy(u.y), r = look.r * view.s, age = (cur - u.td) / TR;
+    if (look.burst) {
+      // flash / HE: a quick expanding burst
+      const k = Math.min(1, age / look.burst);
+      ctx.globalAlpha = (1 - k) * .8;
+      ctx.strokeStyle = col; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.arc(x, y, Math.max(4, r * (0.3 + 0.7 * k)), 0, Math.PI * 2); ctx.stroke();
+      if (u.kind === 'flash') { ctx.fillStyle = col; ctx.globalAlpha = (1 - k) * .35; ctx.fill(); }
+    } else {
+      // smoke / fire / decoy: an area that fades in and out
+      const left = (u.te - cur) / TR;
+      ctx.globalAlpha = Math.max(0, Math.min(1, age / 0.5, left / 1)) * (u.kind === 'smoke' ? .6 : .45);
+      ctx.fillStyle = col;
+      ctx.beginPath(); ctx.arc(x, y, Math.max(3, r), 0, Math.PI * 2); ctx.fill();
+      ctx.globalAlpha *= 1.4; ctx.strokeStyle = col; ctx.lineWidth = 1.5; ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+}
 function drawX(wx, wy, col, big) {
   const x = sx(wx), y = sy(wy), s = big ? 7 : 5;
   ctx.strokeStyle = col; ctx.lineWidth = big ? 3 : 2; ctx.globalAlpha = .85;
@@ -409,6 +475,13 @@ function eventText(e) {
   if (e.type === 'contact') return '<b>First contact</b>';
   if (e.type === 'plant') return `${esc(shortName(e.planter))} planted the bomb`;
   if (e.type === 'hurt') return `${esc(shortName(e.attacker))} hit ${esc(shortName(e.victim))} for ${e.dmg}`;
+  if (e.type === 'util') {
+    const u = e.u, who = `<span class="dot" style="background:var(--${UTIL[u.kind].col})"></span>${esc(shortName(u.by))}'s ${UTIL[u.kind].name}`;
+    if (u.kind !== 'flash') return `<span style="color:var(--muted)">${who}${u.kind === 'smoke' ? ' popped' : ' landed'}</span>`;
+    if (!u.blinded.length) return `<span style="color:var(--muted)">${who} blinded nobody</span>`;
+    const hitAnchor = u.blinded.some(b => b[0] === R.player);
+    return `<span class="${hitAnchor ? 'neg' : ''}">${who} blinded ${u.blinded.map(b => `${esc(shortName(b[0]))} ${b[1]}s`).join(', ')}</span>`;
+  }
   const w = e.weapon ? ` <span style="color:var(--muted)">(${esc(e.weapon)}${e.hs ? ', HS' : ''})</span>` : '';
   const c = e.by_anchor ? 'pos' : e.anchor_died ? 'neg' : '';
   return `<span class="${c}">${esc(shortName(e.attacker))} killed ${esc(shortName(e.victim))}</span>${w}`;
@@ -429,13 +502,15 @@ function renderNotes() {
         <td class="${cls(b.value)}">${fmt(b.value)}</td></tr>`).join('')}
       <tr class="total"><td>Fight score</td><td class="${cls(total)}">${fmt(total)}</td></tr></table>
     <h2>Events</h2>
-    <ul class="feed" id="feed">${R.events.map((e, i) => `<li data-i="${i}"><span class="tm">${rel(e.t)}</span><span>${eventText(e)}</span></li>`).join('')}</ul>
+    <ul class="feed" id="feed">${R.feed.map((e, i) => `<li data-i="${i}" class="${e.type === 'util' ? 'util' : ''}"><span class="tm">${rel(e.t)}</span><span>${eventText(e)}</span></li>`).join('')}</ul>
     <p class="hint" style="margin-top:16px">HLTV 3.0-style: six sub-ratings (1.00 = average anchor fight) weighted into the fight score. Rating = 1.00 + average fight score.</p>`;
-  $('feed').querySelectorAll('li').forEach(li => li.onclick = () => { seek(R.events[+li.dataset.i].t - 2 * TR); });
+  $('feed').querySelectorAll('li').forEach(li => li.onclick = () => { seek(R.feed[+li.dataset.i].t - 2 * TR); });
+  updateFeed();
 }
 function updateFeed() {
   const f = $('feed'); if (!f) return;
-  f.querySelectorAll('li').forEach(li => li.classList.toggle('past', R.events[+li.dataset.i].t <= cur));
+  f.classList.toggle('no-util', !showUtil);
+  f.querySelectorAll('li').forEach(li => li.classList.toggle('past', R.feed[+li.dataset.i].t <= cur));
 }
 
 // ---------- timeline
@@ -487,6 +562,13 @@ $('tocontact').onclick = () => R && seek(R.contact_tick);
 $('speed').onchange = e => speed = +e.target.value;
 $('fit').onclick = fitMap;
 $('focus').onclick = focusFight;
+$('util').onclick = () => {
+  showUtil = !showUtil;
+  $('util').textContent = 'Utility: ' + (showUtil ? 'on' : 'off');
+  document.body.classList.toggle('no-util', !showUtil);
+  if (R) updateFeed();
+  draw();
+};
 $('level').onclick = () => {
   level = { auto: 'upper', upper: 'lower', lower: 'auto' }[level];
   $('level').textContent = 'Level: ' + level; draw();
@@ -499,6 +581,7 @@ document.addEventListener('keydown', e => {
   else if (e.key === 'ArrowLeft') seek(cur - TR);
   else if (e.key === ']') step(1);
   else if (e.key === '[') step(-1);
+  else if (e.key === 'u' || e.key === 'U') $('util').click();
 });
 
 // zoom + pan

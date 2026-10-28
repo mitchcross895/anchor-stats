@@ -114,7 +114,30 @@ EVENTS = {
     "player_death": ["tick", "user_steamid", "attacker_steamid", "assister_steamid", "weapon", "headshot"],
     "player_hurt": ["tick", "user_steamid", "attacker_steamid", "dmg_health"],
     "bomb_planted": ["tick", "user_steamid"],
+    # utility, for the viewer
+    "smokegrenade_detonate": ["tick", "entityid", "x", "y"],
+    "smokegrenade_expired": ["tick", "entityid"],
+    "inferno_startburn": ["tick", "entityid", "x", "y"],
+    "inferno_expire": ["tick", "entityid"],
+    "flashbang_detonate": ["tick", "entityid", "x", "y"],
+    "hegrenade_detonate": ["tick", "entityid", "x", "y"],
+    "decoy_started": ["tick", "entityid", "x", "y"],
+    "decoy_detonate": ["tick", "entityid"],
+    "player_blind": ["tick", "entityid", "user_steamid", "attacker_steamid", "blind_duration"],
 }
+
+# Thrown grenades: projectile class -> (kind, event where it goes off, event where
+# its effect ends, seconds the effect lasts if that event is missing). A molotov's
+# fire is its own entity, so it's matched to the projectile by time and place.
+GRENADES = {
+    "CSmokeGrenadeProjectile": ("smoke", "smokegrenade_detonate", "smokegrenade_expired", 20),
+    "CFlashbangProjectile": ("flash", "flashbang_detonate", None, 0),
+    "CHEGrenadeProjectile": ("he", "hegrenade_detonate", None, 0),
+    "CMolotovProjectile": ("molotov", None, "inferno_expire", 7),
+    "CIncendiaryGrenadeProjectile": ("molotov", None, "inferno_expire", 7),
+    "CDecoyProjectile": ("decoy", "decoy_started", "decoy_detonate", 15),
+}
+GRENADE_PATH_EVERY = 8        # viewer: keep every 8th tick of a grenade's flight
 
 T_TEAM, CT_TEAM = 2, 3
 
@@ -178,6 +201,53 @@ def parse_events(parser):
     return events
 
 
+def grenade_throws(parser, events):
+    """Every thrown grenade: flight path, where and when it went off, when its effect ended, who it blinded."""
+    try:
+        g = parser.parse_grenades()
+    except Exception:  # utility is a viewer extra; never fail a demo over it
+        return []
+    g = g[g["grenade_type"].isin(list(GRENADES)) & g["x"].notna()].sort_values(["grenade_entity_id", "tick"])
+    # entity ids get reused during a match, so a gap in ticks starts a new throw
+    new_throw = (g["grenade_entity_id"] != g["grenade_entity_id"].shift()) | (g["tick"].diff() > 32)
+    throws = []
+    for _, t in g.groupby(new_throw.cumsum()):
+        kind, went_off, ended, lasts = GRENADES[t["grenade_type"].iloc[0]]
+        entity = int(t["grenade_entity_id"].iloc[0])
+        start, last = int(t["tick"].iloc[0]), int(t["tick"].iloc[-1])
+        det, x, y, effect = last, t["x"].iloc[-1], t["y"].iloc[-1], entity
+        if went_off:
+            e = events[went_off]
+            e = e[(e["entityid"] == entity) & (e["tick"] >= start) & (e["tick"] <= last + 64)]
+            if len(e):
+                det, x, y = int(e["tick"].iloc[0]), e["x"].iloc[0], e["y"].iloc[0]
+        else:
+            e = events["inferno_startburn"]
+            e = e[(e["tick"] >= last - 16) & (e["tick"] <= last + 64)]
+            gap = (e["x"] - x) ** 2 + (e["y"] - y) ** 2
+            if len(e) and gap.min() <= 300 ** 2:
+                i = gap.idxmin()
+                det, x, y, effect = int(e.at[i, "tick"]), e.at[i, "x"], e.at[i, "y"], int(e.at[i, "entityid"])
+        end = det
+        if ended:
+            e = events[ended]
+            e = e[(e["entityid"] == effect) & (e["tick"] > det)]
+            end = int(e["tick"].iloc[0]) if len(e) else det + lasts * TICKRATE
+
+        flight = t[t["tick"] <= det]
+        path = [[int(r.tick), num(r.x), num(r.y)] for r in flight.iloc[::GRENADE_PATH_EVERY].itertuples()]
+        if len(flight) and path[-1][0] != int(flight["tick"].iloc[-1]):
+            path.append([int(flight["tick"].iloc[-1]), num(flight["x"].iloc[-1]), num(flight["y"].iloc[-1])])
+        blinded = []
+        if kind == "flash":
+            b = events["player_blind"]
+            b = b[(b["entityid"] == entity) & ((b["tick"] - det).abs() <= 16)]
+            blinded = [(r.user_steamid, round(float(r.blind_duration), 1)) for r in b.itertuples()]
+        throws.append({"kind": kind, "by": sid(t["steamid"].iloc[0]), "t0": start, "td": det, "te": end,
+                       "x": num(x), "y": num(y), "path": path or [[det, num(x), num(y)]], "blinded": blinded})
+    return throws
+
+
 def get_rounds(events):
     """Return a list of (round_no, freeze_end_tick, end_tick, winner)."""
     freeze, ends, start = events["round_freeze_end"], events["round_end"], events["round_announce_match_start"]
@@ -213,6 +283,7 @@ def analyse(path, site_places):
     events = parse_events(parser)
     deaths, hurts, plants = events["player_death"], events["player_hurt"], events["bomb_planted"]
     rounds = get_rounds(events)
+    throws = grenade_throws(parser, events)
 
     sample_ticks = sorted({t for _, ft, et, _ in rounds for t in range(ft, et + 1, SAMPLE_EVERY)})
     ticks = parser.parse_ticks(
@@ -468,6 +539,11 @@ def analyse(path, site_places):
                 clip_events.append({"t": int(p.tick), "type": "plant", "planter": names.get(p.user_steamid, "?"),
                                     "planter_id": pidx.get(p.user_steamid)})
             clip_events.sort(key=lambda e: e["t"])
+            # dead players watching also get "blinded", so only keep those alive when the flash went off
+            alive_at = lambda t: set(rticks.loc[(rticks["tick"] - t).abs() <= SAMPLE_EVERY, "steamid"])
+            utility = [dict(u, by=names.get(u["by"], "?"), team="CT" if team_of.get(u["by"]) == CT_TEAM else "T",
+                            blinded=[[names.get(p, "?"), s] for p, s in u["blinded"] if p in alive_at(u["td"])])
+                       for u in throws if ft <= u["t0"] <= view_hi and u["te"] >= view_lo]
 
             eid = len(engagements)
             reviews.append({
@@ -475,7 +551,7 @@ def analyse(path, site_places):
                 "spot": [num(spot[0]), num(spot[1])],
                 "players": [{"name": names.get(p, p), "team": "CT" if team_of.get(p) == CT_TEAM else "T",
                              "local": p in enemies or p in mates} for p in pids],
-                "frames": frames, "events": clip_events, "notes": notes,
+                "frames": frames, "events": clip_events, "utility": utility, "notes": notes,
                 "breakdown": [{"label": l, "value": round(v, 2), "detail": d} for l, v, d in parts],
             })
 
