@@ -182,7 +182,8 @@
 <script id="data" type="application/json">__DATA__</script>
 <script>
 // Embedded data = a standalone review.html export; null = served by the app, which handles uploads.
-const EMBEDDED = JSON.parse(document.getElementById('data').textContent);
+let EMBEDDED = null;
+try { EMBEDDED = JSON.parse(document.getElementById('data').textContent); } catch (e) { /* the raw template */ }
 let D = null, TR = 64;
 const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 const C = {};
@@ -626,7 +627,14 @@ function startApp() {
 
 window.addEventListener('resize', resize);
 resize();
-if (EMBEDDED) load(EMBEDDED); else startApp();
+if (EMBEDDED) load(EMBEDDED);
+else if (location.protocol === 'file:') {
+  // opened from disk instead of through the app, so there's nothing to upload to
+  $('empty').hidden = false;
+  $('empty').innerHTML = `<div><b>Start the app to upload demos</b>
+    <p class="hint">Double-click <code>run.bat</code> (or run <code>./run.sh</code>) in the anchor-stats folder.<br>
+    Anchor Review opens in your browser with the Upload button, and parses demos as you add them.</p></div>`;
+} else startApp();
 requestAnimationFrame(tick);
 </script>
 </body>
