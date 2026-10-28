@@ -1,0 +1,449 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Anchor Review</title>
+<style>
+  :root {
+    --bg: #101317; --panel: #171b21; --panel-2: #1e232b; --line: #2a313b;
+    --text: #e6e9ee; --muted: #8b94a3; --map: #2b323c; --map-label: #5d6775;
+    --ct: #5aa9ff; --t: #f0a03c; --anchor: #ffffff; --good: #4fd18b; --bad: #ff6b6b;
+    --contact: #ffd84d; --accent: #8fb8ff;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body { background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  button, select { font: inherit; color: inherit; }
+  .app { display: grid; grid-template-columns: 290px 1fr 360px; height: 100vh; }
+  aside, .notes { background: var(--panel); overflow-y: auto; }
+  aside { border-right: 1px solid var(--line); }
+  .notes { border-left: 1px solid var(--line); padding: 16px; }
+  h1 { font-size: 15px; margin: 0; padding: 14px 16px 4px; letter-spacing: .02em; }
+  .sub { color: var(--muted); font-size: 12px; padding: 0 16px 12px; }
+  h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 18px 0 8px; }
+  aside h2 { padding: 0 16px; }
+
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  .ratings td, .ratings th { padding: 5px 8px; text-align: right; font-size: 12.5px; }
+  .ratings th { color: var(--muted); font-weight: 500; }
+  .ratings td:first-child, .ratings th:first-child { text-align: left; padding-left: 16px; }
+  .ratings tr.row { cursor: pointer; }
+  .ratings tr.row:hover, .ratings tr.sel { background: var(--panel-2); }
+
+  .list { list-style: none; margin: 0; padding: 0 8px 16px; }
+  .list li { padding: 8px 10px; border-radius: 6px; cursor: pointer; display: grid;
+             grid-template-columns: 34px 1fr auto; gap: 2px 8px; align-items: center; }
+  .list li:hover { background: var(--panel-2); }
+  .list li.on { background: var(--panel-2); box-shadow: inset 3px 0 0 var(--accent); }
+  .list .r { color: var(--muted); font-size: 12px; }
+  .list .who { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .list .meta { grid-column: 2; color: var(--muted); font-size: 12px; }
+  .list .sc { grid-row: 1 / span 2; grid-column: 3; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .pos { color: var(--good); } .neg { color: var(--bad); }
+
+  main { display: flex; flex-direction: column; min-width: 0; }
+  .stage { position: relative; flex: 1; min-height: 0; }
+  canvas { position: absolute; inset: 0; width: 100%; height: 100%; cursor: grab; }
+  canvas.drag { cursor: grabbing; }
+  .clock { position: absolute; top: 12px; left: 14px; background: rgba(16,19,23,.8); padding: 6px 10px;
+           border-radius: 6px; font-variant-numeric: tabular-nums; font-size: 13px; pointer-events: none; }
+  .legend { position: absolute; top: 12px; right: 14px; background: rgba(16,19,23,.8); padding: 6px 10px;
+            border-radius: 6px; font-size: 12px; color: var(--muted); display: flex; gap: 12px; pointer-events: none; }
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 5px; vertical-align: -1px; }
+
+  .controls { border-top: 1px solid var(--line); background: var(--panel); padding: 10px 14px 12px; }
+  .bar { position: relative; height: 22px; margin-bottom: 8px; }
+  .bar input { position: absolute; inset: 0; width: 100%; margin: 0; accent-color: var(--accent); }
+  .marks { position: absolute; left: 8px; right: 8px; top: 0; bottom: 0; pointer-events: none; }
+  .mark { position: absolute; top: 0; width: 3px; height: 7px; border-radius: 2px; transform: translateX(-1px); }
+  .row-btns { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+  .row-btns button, .row-btns select { background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px;
+           padding: 5px 10px; cursor: pointer; }
+  .row-btns button:hover { border-color: var(--accent); }
+  .row-btns .spacer { flex: 1; }
+  .hint { color: var(--muted); font-size: 12px; }
+
+  .head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
+  .title { font-size: 18px; font-weight: 700; }
+  .badges { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
+  .badge { background: var(--panel-2); border: 1px solid var(--line); border-radius: 999px; padding: 1px 9px; font-size: 12px; }
+  .big { font-size: 30px; font-weight: 800; font-variant-numeric: tabular-nums; line-height: 1; text-align: right; }
+  .big small { display: block; font-size: 11px; font-weight: 500; color: var(--muted); margin-top: 4px; }
+  .why { margin: 0; padding-left: 18px; }
+  .why li { margin-bottom: 6px; }
+  .bd td { padding: 6px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+  .bd td:last-child { text-align: right; font-weight: 600; white-space: nowrap; padding-left: 10px; }
+  .bd .d { color: var(--muted); font-size: 12px; }
+  .bd tr.total td { border-bottom: 0; font-weight: 700; }
+  .feed { list-style: none; margin: 0; padding: 0; font-size: 12.5px; }
+  .feed li { padding: 4px 6px; border-radius: 4px; cursor: pointer; display: flex; gap: 8px; color: var(--muted); }
+  .feed li.past { color: var(--text); }
+  .feed li:hover { background: var(--panel-2); }
+  .feed .tm { font-variant-numeric: tabular-nums; min-width: 44px; }
+
+  @media (max-width: 1100px) {
+    .app { grid-template-columns: 1fr; height: auto; }
+    aside, .notes { border: 0; max-height: none; }
+    .stage { height: 70vh; flex: none; }
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <aside>
+    <h1>Anchor Review</h1>
+    <div class="sub" id="mapname"></div>
+    <h2>Ratings</h2>
+    <table class="ratings" id="ratings"></table>
+    <h2>Engagements</h2>
+    <ul class="list" id="list"></ul>
+  </aside>
+
+  <main>
+    <div class="stage" id="stage">
+      <canvas id="cv"></canvas>
+      <div class="clock" id="clock"></div>
+      <div class="legend">
+        <span><span class="dot" style="background:var(--ct)"></span>CT</span>
+        <span><span class="dot" style="background:var(--t)"></span>T</span>
+        <span><span class="dot" style="background:var(--anchor)"></span>Anchor</span>
+        <span>dashed ring = local area</span>
+      </div>
+    </div>
+    <div class="controls">
+      <div class="bar">
+        <input type="range" id="scrub" min="0" max="1" step="1" value="0">
+        <div class="marks" id="marks"></div>
+      </div>
+      <div class="row-btns">
+        <button id="prev" title="Previous engagement ( [ )">&#9664;&#9664;</button>
+        <button id="play" title="Play / pause (space)">Play</button>
+        <button id="next" title="Next engagement ( ] )">&#9654;&#9654;</button>
+        <button id="tocontact" title="Jump to contact">Contact</button>
+        <select id="speed" title="Playback speed">
+          <option value="0.5">0.5x</option><option value="1" selected>1x</option>
+          <option value="2">2x</option><option value="4">4x</option>
+        </select>
+        <button id="fit">Fit map</button>
+        <button id="focus">Focus fight</button>
+        <span class="spacer"></span>
+        <span class="hint">space play &middot; &larr;/&rarr; 1s &middot; [ ] fight &middot; scroll zoom &middot; drag pan</span>
+      </div>
+    </div>
+  </main>
+
+  <section class="notes" id="notes"></section>
+</div>
+
+<script id="data" type="application/json">__DATA__</script>
+<script>
+const D = JSON.parse(document.getElementById('data').textContent);
+const TR = D.tickrate;
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const C = {};
+['--map','--map-label','--ct','--t','--anchor','--good','--bad','--contact','--muted','--text','--bg'].forEach(k => C[k.slice(2)] = css(k));
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const fmt = v => (v > 0 ? '+' : '') + v.toFixed(2);
+const cls = v => v > 0 ? 'pos' : v < 0 ? 'neg' : '';
+
+// ---------- map bounds
+const B = D.background, cell = B.cell;
+let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+for (const [x, y] of B.cells) { minX = Math.min(minX, x); maxX = Math.max(maxX, x); minY = Math.min(minY, y); maxY = Math.max(maxY, y); }
+minX *= cell; minY *= cell; maxX = (maxX + 1) * cell; maxY = (maxY + 1) * cell;
+
+// ---------- prepare reviews
+for (const R of D.reviews) {
+  for (const f of R.frames) f.m = new Map(f.p.map(e => [e[0], e]));
+  R.start = R.frames.length ? R.frames[0].t : R.contact_tick;
+  R.end = R.frames.length ? R.frames[R.frames.length - 1].t : R.contact_tick;
+  for (const e of R.events) {
+    e.apos = lastPos(R, e.attacker_id ?? e.planter_id, e.t);
+    e.vpos = lastPos(R, e.victim_id, e.t);
+  }
+}
+function lastPos(R, pid, t) {
+  if (pid == null) return null;
+  for (let i = R.frames.length - 1; i >= 0; i--) {
+    const f = R.frames[i];
+    if (f.t > t) continue;
+    const e = f.m.get(pid);
+    if (e) return [e[1], e[2]];
+  }
+  return null;
+}
+
+// ---------- state
+let R = null, cur = 0, playing = false, speed = 1, filter = null;
+const view = { x: 0, y: 0, s: 1 };
+const cv = $('cv'), ctx = cv.getContext('2d');
+let W = 0, H = 0;
+
+function resize() {
+  const r = $('stage').getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+  W = r.width; H = r.height;
+  cv.width = W * dpr; cv.height = H * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  draw();
+}
+const sx = x => W / 2 + (x - view.x) * view.s;
+const sy = y => H / 2 - (y - view.y) * view.s;
+
+function fitBox(x0, y0, x1, y1) {
+  view.x = (x0 + x1) / 2; view.y = (y0 + y1) / 2;
+  view.s = Math.min(W / (x1 - x0), H / (y1 - y0)) * 0.92;
+  draw();
+}
+const fitMap = () => fitBox(minX, minY, maxX, maxY);
+function focusFight() {
+  if (!R) return fitMap();
+  const pts = [R.spot];
+  for (const f of R.frames) {
+    if (Math.abs(f.t - R.contact_tick) > 6 * TR) continue;
+    for (const e of f.p) if (R.players[e[0]].local || e[0] === R.anchor_id) pts.push([e[1], e[2]]);
+  }
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const [x, y] of pts) { x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x); y1 = Math.max(y1, y); }
+  const pad = 700, minSpan = 2600;
+  const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
+  const hw = Math.max((x1 - x0) / 2 + pad, minSpan / 2), hh = Math.max((y1 - y0) / 2 + pad, minSpan / 2);
+  fitBox(cx - hw, cy - hh, cx + hw, cy + hh);
+}
+
+// ---------- interpolation
+function frameAt(t) {
+  const f = R.frames, n = f.length;
+  if (!n) return null;
+  if (t <= f[0].t) return [0, 0, 0];
+  if (t >= f[n - 1].t) return [n - 1, n - 1, 0];
+  let lo = 0, hi = n - 1;
+  while (hi - lo > 1) { const m = (lo + hi) >> 1; if (f[m].t <= t) lo = m; else hi = m; }
+  return [lo, hi, (t - f[lo].t) / (f[hi].t - f[lo].t)];
+}
+function lerpAngle(a, b, k) { let d = ((b - a + 540) % 360) - 180; return a + d * k; }
+function positions(t) {
+  const out = new Map(), fa = frameAt(t);
+  if (!fa) return out;
+  const [a, b, k] = fa, A = R.frames[a].m, Bm = R.frames[b].m;
+  for (const [pid, e] of A) {
+    const n = Bm.get(pid);
+    if (n) out.set(pid, { x: e[1] + (n[1] - e[1]) * k, y: e[2] + (n[2] - e[2]) * k, yaw: lerpAngle(e[3], n[3], k), hp: n[4] });
+    else if (a === b || k < 0.5) out.set(pid, { x: e[1], y: e[2], yaw: e[3], hp: e[4] });
+  }
+  return out;
+}
+
+// ---------- drawing
+function draw() {
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = C.bg; ctx.fillRect(0, 0, W, H);
+  // map silhouette
+  ctx.fillStyle = C.map;
+  const cs = cell * view.s + 0.6;
+  for (const [x, y] of B.cells) ctx.fillRect(sx(x * cell), sy((y + 1) * cell), cs, cs);
+  // place labels
+  ctx.fillStyle = C['map-label']; ctx.font = '600 11px system-ui, sans-serif'; ctx.textAlign = 'center';
+  for (const l of B.labels) ctx.fillText(l.name, sx(l.x), sy(l.y));
+  if (!R) return;
+
+  const pos = positions(cur);
+  const anchor = pos.get(R.anchor_id);
+
+  // local-area ring
+  const ringAt = anchor || { x: R.spot[0], y: R.spot[1] };
+  ctx.save();
+  ctx.setLineDash([6, 6]); ctx.strokeStyle = cur >= R.contact_tick ? C.contact : C.muted; ctx.globalAlpha = .55; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.arc(sx(ringAt.x), sy(ringAt.y), D.local_radius * view.s, 0, Math.PI * 2); ctx.stroke();
+  ctx.restore();
+
+  // events: death markers, shot lines, bomb
+  for (const e of R.events) {
+    if (e.t > cur) continue;
+    const age = (cur - e.t) / TR;
+    if (e.type === 'kill' && e.vpos) {
+      const victim = R.players[e.victim_id];
+      drawX(e.vpos[0], e.vpos[1], victim ? (victim.team === 'CT' ? C.ct : C.t) : C.muted, e.anchor_died);
+      if (age < 1.5 && e.apos) line(e.apos, e.vpos, e.by_anchor ? C.good : C.bad, 2.5, 1 - age / 1.5);
+    } else if (e.type === 'hurt' && age < 0.6 && e.apos && e.vpos) {
+      line(e.apos, e.vpos, e.by_anchor ? C.good : C.bad, 1.2, 0.8 * (1 - age / 0.6));
+    } else if (e.type === 'plant' && e.apos) {
+      const x = sx(e.apos[0]), y = sy(e.apos[1]);
+      ctx.fillStyle = C.bad; ctx.fillRect(x - 6, y - 6, 12, 12);
+      ctx.fillStyle = C.bg; ctx.font = '700 10px system-ui'; ctx.textAlign = 'center'; ctx.fillText('C4', x, y + 3.5);
+    }
+  }
+
+  // players
+  for (const [pid, p] of pos) {
+    const pl = R.players[pid], isA = pid === R.anchor_id;
+    const col = pl.team === 'CT' ? C.ct : C.t;
+    const x = sx(p.x), y = sy(p.y), r = isA ? 8 : 6;
+    const a = p.yaw * Math.PI / 180;
+    ctx.globalAlpha = pl.local || isA ? 1 : 0.45;
+    ctx.strokeStyle = col; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + Math.cos(a) * (r + 12), y - Math.sin(a) * (r + 12)); ctx.stroke();
+    ctx.fillStyle = col; ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
+    if (isA) { ctx.strokeStyle = C.anchor; ctx.lineWidth = 2.5; ctx.beginPath(); ctx.arc(x, y, r + 3, 0, Math.PI * 2); ctx.stroke(); }
+    // health bar
+    ctx.fillStyle = 'rgba(0,0,0,.6)'; ctx.fillRect(x - 10, y + r + 4, 20, 3);
+    ctx.fillStyle = p.hp > 50 ? C.good : p.hp > 20 ? C.contact : C.bad; ctx.fillRect(x - 10, y + r + 4, 20 * Math.max(0, p.hp) / 100, 3);
+    // name
+    ctx.fillStyle = isA ? C.anchor : C.text; ctx.font = (isA ? '700 ' : '500 ') + '11px system-ui'; ctx.textAlign = 'left';
+    ctx.fillText(shortName(pl.name), x + r + 5, y - r);
+    ctx.globalAlpha = 1;
+  }
+}
+const shortName = n => n.includes('|') ? n.split('|').pop().trim() : n;
+function drawX(wx, wy, col, big) {
+  const x = sx(wx), y = sy(wy), s = big ? 7 : 5;
+  ctx.strokeStyle = col; ctx.lineWidth = big ? 3 : 2; ctx.globalAlpha = .85;
+  ctx.beginPath(); ctx.moveTo(x - s, y - s); ctx.lineTo(x + s, y + s); ctx.moveTo(x + s, y - s); ctx.lineTo(x - s, y + s); ctx.stroke();
+  ctx.globalAlpha = 1;
+}
+function line(a, b, col, w, alpha) {
+  ctx.globalAlpha = Math.max(0, alpha); ctx.strokeStyle = col; ctx.lineWidth = w;
+  ctx.beginPath(); ctx.moveTo(sx(a[0]), sy(a[1])); ctx.lineTo(sx(b[0]), sy(b[1])); ctx.stroke();
+  ctx.globalAlpha = 1;
+}
+
+// ---------- UI: sidebar
+$('mapname').textContent = `${D.map} · ${D.reviews.length} anchor engagements`;
+function renderRatings() {
+  const rows = D.ratings.map(r => `<tr class="row ${filter === r.player ? 'sel' : ''}" data-p="${esc(r.player)}">
+      <td>${esc(shortName(r.player))}</td><td>${r.engagements}</td><td>${r.kills}/${r.exp_kills.toFixed(1)}</td>
+      <td class="${cls(r.anchor_rating - 1)}"><b>${r.anchor_rating.toFixed(2)}</b></td></tr>`).join('');
+  $('ratings').innerHTML = `<tr><th>Player</th><th>Fights</th><th>K/exp</th><th>Rating</th></tr>${rows}`;
+  $('ratings').querySelectorAll('tr.row').forEach(tr => tr.onclick = () => {
+    filter = filter === tr.dataset.p ? null : tr.dataset.p; renderRatings(); renderList();
+  });
+}
+function visible() { return D.reviews.filter(r => !filter || r.player === filter); }
+function renderList() {
+  $('list').innerHTML = visible().map(r => `<li data-id="${r.id}" class="${R && R.id === r.id ? 'on' : ''}">
+      <span class="r">R${r.round}</span><span class="who">${esc(shortName(r.player))}</span>
+      <span class="sc ${cls(r.score)}">${fmt(r.score)}</span>
+      <span class="meta">${r.site} · ${r.situation} · ${r.kills}K${r.contact === 'no contact' ? ' · no contact' : ''}</span></li>`).join('');
+  $('list').querySelectorAll('li').forEach(li => li.onclick = () => select(+li.dataset.id));
+}
+
+// ---------- UI: notes
+function rel(t) { const s = (t - R.contact_tick) / TR; return (s >= 0 ? '+' : '') + s.toFixed(1) + 's'; }
+function eventText(e) {
+  if (e.type === 'contact') return '<b>First contact</b>';
+  if (e.type === 'plant') return `${esc(shortName(e.planter))} planted the bomb`;
+  if (e.type === 'hurt') return `${esc(shortName(e.attacker))} hit ${esc(shortName(e.victim))} for ${e.dmg}`;
+  const w = e.weapon ? ` <span style="color:var(--muted)">(${esc(e.weapon)}${e.hs ? ', HS' : ''})</span>` : '';
+  const c = e.by_anchor ? 'pos' : e.anchor_died ? 'neg' : '';
+  return `<span class="${c}">${esc(shortName(e.attacker))} killed ${esc(shortName(e.victim))}</span>${w}`;
+}
+function renderNotes() {
+  const total = R.breakdown.reduce((s, b) => s + b.value, 0);
+  $('notes').innerHTML = `
+    <div class="head">
+      <div><div class="title">${esc(R.player)}</div>
+        <div class="badges"><span class="badge">Round ${R.round}</span><span class="badge">Site ${R.site}</span>
+          <span class="badge">${R.situation}</span><span class="badge">${R.round_won ? 'CT win' : 'T win'}</span></div></div>
+      <div class="big ${cls(R.score)}">${fmt(R.score)}<small>vs average anchor</small></div>
+    </div>
+    <h2>Why this score</h2>
+    <ul class="why">${R.notes.map(n => `<li>${esc(n)}</li>`).join('')}</ul>
+    <h2>Score breakdown</h2>
+    <table class="bd">${R.breakdown.map(b => `<tr><td>${esc(b.label)}<div class="d">${esc(b.detail)}</div></td>
+        <td class="${cls(b.value)}">${fmt(b.value)}</td></tr>`).join('')}
+      <tr class="total"><td>Fight score</td><td class="${cls(total)}">${fmt(total)}</td></tr></table>
+    <h2>Events</h2>
+    <ul class="feed" id="feed">${R.events.map((e, i) => `<li data-i="${i}"><span class="tm">${rel(e.t)}</span><span>${eventText(e)}</span></li>`).join('')}</ul>
+    <p class="hint" style="margin-top:16px">Rating = 1.00 + average fight score. Damage only scores as a bonus when it lands on Ts the anchor didn't kill.</p>`;
+  $('feed').querySelectorAll('li').forEach(li => li.onclick = () => { seek(R.events[+li.dataset.i].t - 2 * TR); });
+}
+function updateFeed() {
+  const f = $('feed'); if (!f) return;
+  f.querySelectorAll('li').forEach(li => li.classList.toggle('past', R.events[+li.dataset.i].t <= cur));
+}
+
+// ---------- timeline
+function renderMarks() {
+  const span = Math.max(1, R.end - R.start);
+  $('marks').innerHTML = R.events.filter(e => e.type !== 'hurt').map(e => {
+    const col = e.type === 'contact' ? 'var(--contact)' : e.type === 'plant' ? 'var(--bad)'
+      : e.by_anchor ? 'var(--good)' : e.anchor_died ? 'var(--bad)' : 'var(--muted)';
+    return `<span class="mark" title="${e.type}" style="left:${(e.t - R.start) / span * 100}%;background:${col}"></span>`;
+  }).join('');
+}
+function seek(t) {
+  cur = Math.max(R.start, Math.min(R.end, t));
+  $('scrub').value = cur;
+  $('clock').textContent = `Round ${R.round} · contact ${rel(cur)}`;
+  updateFeed(); draw();
+}
+function select(id) {
+  R = D.reviews.find(r => r.id === id);
+  $('scrub').min = R.start; $('scrub').max = R.end;
+  renderList(); renderNotes(); renderMarks();
+  focusFight();
+  seek(R.start);
+  setPlaying(true);
+}
+function step(dir) {
+  const v = visible(), i = v.findIndex(r => r.id === R.id);
+  const n = v[(i + dir + v.length) % v.length];
+  if (n) select(n.id);
+}
+
+// ---------- playback
+function setPlaying(p) { playing = p; $('play').textContent = p ? 'Pause' : 'Play'; }
+let last = performance.now();
+function tick(now) {
+  const dt = Math.min(0.1, (now - last) / 1000); last = now;
+  if (playing && R) {
+    if (cur >= R.end) setPlaying(false);
+    else seek(cur + dt * TR * speed);
+  }
+  requestAnimationFrame(tick);
+}
+
+$('play').onclick = () => { if (R && cur >= R.end) seek(R.start); setPlaying(!playing); };
+$('prev').onclick = () => step(-1);
+$('next').onclick = () => step(1);
+$('tocontact').onclick = () => seek(R.contact_tick);
+$('speed').onchange = e => speed = +e.target.value;
+$('fit').onclick = fitMap;
+$('focus').onclick = focusFight;
+$('scrub').oninput = e => { setPlaying(false); seek(+e.target.value); };
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'SELECT') return;
+  if (e.code === 'Space') { e.preventDefault(); $('play').click(); }
+  else if (e.key === 'ArrowRight') seek(cur + TR);
+  else if (e.key === 'ArrowLeft') seek(cur - TR);
+  else if (e.key === ']') step(1);
+  else if (e.key === '[') step(-1);
+});
+
+// zoom + pan
+cv.addEventListener('wheel', e => {
+  e.preventDefault();
+  const r = cv.getBoundingClientRect(), mx = e.clientX - r.left, my = e.clientY - r.top;
+  const wx = view.x + (mx - W / 2) / view.s, wy = view.y - (my - H / 2) / view.s;
+  view.s *= Math.exp(-e.deltaY * 0.0015);
+  view.x = wx - (mx - W / 2) / view.s; view.y = wy + (my - H / 2) / view.s;
+  draw();
+}, { passive: false });
+let dragFrom = null;
+cv.addEventListener('pointerdown', e => { dragFrom = [e.clientX, e.clientY, view.x, view.y]; cv.classList.add('drag'); cv.setPointerCapture(e.pointerId); });
+cv.addEventListener('pointermove', e => {
+  if (!dragFrom) return;
+  view.x = dragFrom[2] - (e.clientX - dragFrom[0]) / view.s;
+  view.y = dragFrom[3] + (e.clientY - dragFrom[1]) / view.s;
+  draw();
+});
+cv.addEventListener('pointerup', () => { dragFrom = null; cv.classList.remove('drag'); });
+
+window.addEventListener('resize', resize);
+renderRatings(); renderList(); resize(); fitMap();
+if (D.reviews.length) select(D.reviews[0].id);
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>
