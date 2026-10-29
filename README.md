@@ -18,6 +18,7 @@ output/
     ratings.txt       text report
     engagements.csv   one row per anchor fight, for spreadsheets
     data.json         what the viewer shows (meta.json marks the demo as finished)
+    match.json        every round, for watching the full match
     excluded.json     fights you took out of the ratings in the viewer (only if you did)
 ```
 
@@ -68,6 +69,8 @@ Utility is shown too:
 Press **U**, or click **Utility**, to hide it. Utility is display-only and doesn't affect the rating.
 
 To leave a fight out of the ratings (a misread anchor, a bugged round, ...), select it and click **Exclude from rating**. The ratings, `ratings.txt` and `engagements.csv` update straight away. The fight stays in the list, struck through, and **Include in rating** puts it back. Exclusions are saved in the demo's `excluded.json`, so they stay put if the demo is reprocessed.
+
+To watch the whole demo, click **Full match** above the list. Every round is listed with its winner, kills and bomb result; pick one to watch it, and playback runs on from round to round. The right-hand panel lists that round's kills and utility, and links to any anchor fights in it. **Anchor fights** takes you back.
 
 To share a review, open it and click **Download offline copy**. That gives you a single `.html` file that works without the app, radar included.
 

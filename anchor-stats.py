@@ -386,7 +386,7 @@ def analyse(path, site_places):
     ticks["site"] = ticks["last_place_name"].map(sites)
     names = dict(zip(ticks["steamid"], ticks["name"]))
 
-    engagements, reviews = [], []
+    engagements, reviews, match = [], [], []
     prev_end = 0
     for rnd, ft, et, winner in rounds:
         rticks = ticks[(ticks["tick"] >= ft) & (ticks["tick"] <= et)]
@@ -425,6 +425,51 @@ def analyse(path, site_places):
             if team_of.get(d.user_steamid) in alive:
                 alive[team_of[d.user_steamid]] -= 1
             swings.append((d, before, ct_win_prob(alive[CT_TEAM], alive[T_TEAM], planted)))
+
+        # dead players watching also get "blinded", so only keep those alive when the flash went off
+        alive_at = lambda t: set(rticks.loc[(rticks["tick"] - t).abs() <= SAMPLE_EVERY, "steamid"])
+
+        def clip(view_lo, view_hi, anchor=None):
+            """Playback for the viewer from view_lo to view_hi: positions, kills, hits (all of them, or only
+            the anchor's), the plant, utility, the bomb and the clock. Returns (clip, player ids)."""
+            part = r_all[(r_all["tick"] >= view_lo) & (r_all["tick"] <= view_hi)]
+            pids = list(dict.fromkeys(part["steamid"]))
+            pidx = {p: i for i, p in enumerate(pids)}
+            frames, holding, weapons = clip_frames(part, pidx, levels)
+            # who has the bomb: the state when the clip starts, then every change during it
+            before = [e for e in bombs if round_prev_end < e[0] <= view_lo]
+            bomb = [[view_lo, pidx.get(before[-1][1]), None]] if before and before[-1][1] else []
+            bomb += [[t, pidx.get(c), pidx.get(d)] for t, c, d in bombs if view_lo < t <= view_hi]
+            bomb_end = next(((t, k) for t, k in bomb_ends if ft <= t <= et), None)
+            in_view = lambda df: df[(df["tick"] >= view_lo) & (df["tick"] <= view_hi)].itertuples()
+            events = []
+            for d in in_view(r_deaths):
+                events.append({"t": int(d.tick), "type": "kill",
+                               "attacker": names.get(d.attacker_steamid, "world"),
+                               "victim": names.get(d.user_steamid, "?"),
+                               "attacker_id": pidx.get(d.attacker_steamid), "victim_id": pidx.get(d.user_steamid),
+                               "weapon": str(d.weapon) if isinstance(d.weapon, str) else "",
+                               "hs": d.headshot == True,  # noqa: E712 (NaN when missing)
+                               "by_anchor": anchor is not None and d.attacker_steamid == anchor,
+                               "anchor_died": anchor is not None and d.user_steamid == anchor})
+            for h in in_view(r_hurts):
+                if anchor is None or anchor in (h.attacker_steamid, h.user_steamid):
+                    events.append({"t": int(h.tick), "type": "hurt",
+                                   "attacker": names.get(h.attacker_steamid, "world"),
+                                   "victim": names.get(h.user_steamid, "?"),
+                                   "attacker_id": pidx.get(h.attacker_steamid),
+                                   "victim_id": pidx.get(h.user_steamid),
+                                   "dmg": int(h.dmg_health),
+                                   "by_anchor": anchor is not None and h.attacker_steamid == anchor})
+            for p in in_view(r_plants):
+                events.append({"t": int(p.tick), "type": "plant", "planter": names.get(p.user_steamid, "?"),
+                               "planter_id": pidx.get(p.user_steamid)})
+            utility = [dict(u, by=names.get(u["by"], "?"), team="CT" if team_of.get(u["by"]) == CT_TEAM else "T",
+                            blinded=[[names.get(p, "?"), s] for p, s in u["blinded"] if p in alive_at(u["td"])])
+                       for u in throws if ft <= u["t0"] <= view_hi and u["te"] >= view_lo]
+            return {"round": rnd, "frames": frames, "events": events, "utility": utility,
+                    "weapons": weapons, "held": holding, "bomb": bomb, "round_start": ft, "plant_tick": plant_tick,
+                    "bomb_end": list(bomb_end) if bomb_end else None}, pids
 
         for site, members in per_site.items():
             if len(members) != 1:
@@ -604,55 +649,19 @@ def analyse(path, site_places):
             # ---- 7. playback clip for the viewer
             view_lo = max(ft, contact_tick - PRE_ROLL * TICKRATE)
             view_hi = min(et, (death_tick or et) + POST_ROLL * TICKRATE, contact_tick + MAX_CLIP * TICKRATE)
-            clip = r_all[(r_all["tick"] >= view_lo) & (r_all["tick"] <= view_hi)]
-            pids = list(dict.fromkeys(clip["steamid"]))
-            pidx = {p: i for i, p in enumerate(pids)}
-            frames, holding, weapons = clip_frames(clip, pidx, levels)
-            # who has the bomb: the state when the clip starts, then every change during it
-            before = [e for e in bombs if round_prev_end < e[0] <= view_lo]
-            bomb = [[view_lo, pidx.get(before[-1][1]), None]] if before and before[-1][1] else []
-            bomb += [[t, pidx.get(c), pidx.get(d)] for t, c, d in bombs if view_lo < t <= view_hi]
-            bomb_end = next(((t, k) for t, k in bomb_ends if ft <= t <= et), None)
-            in_view = lambda df: df[(df["tick"] >= view_lo) & (df["tick"] <= view_hi)].itertuples()
-            clip_events = [{"t": contact_tick, "type": "contact"}]
-            for d in in_view(r_deaths):
-                clip_events.append({"t": int(d.tick), "type": "kill",
-                                    "attacker": names.get(d.attacker_steamid, "world"),
-                                    "victim": names.get(d.user_steamid, "?"),
-                                    "attacker_id": pidx.get(d.attacker_steamid), "victim_id": pidx.get(d.user_steamid),
-                                    "weapon": str(d.weapon) if isinstance(d.weapon, str) else "",
-                                    "hs": d.headshot == True,  # noqa: E712 (NaN when missing)
-                                    "by_anchor": d.attacker_steamid == anchor, "anchor_died": d.user_steamid == anchor})
-            for h in in_view(r_hurts):
-                if anchor in (h.attacker_steamid, h.user_steamid):
-                    clip_events.append({"t": int(h.tick), "type": "hurt",
-                                        "attacker": names.get(h.attacker_steamid, "world"),
-                                        "victim": names.get(h.user_steamid, "?"),
-                                        "attacker_id": pidx.get(h.attacker_steamid),
-                                        "victim_id": pidx.get(h.user_steamid),
-                                        "dmg": int(h.dmg_health), "by_anchor": h.attacker_steamid == anchor})
-            for p in in_view(r_plants):
-                clip_events.append({"t": int(p.tick), "type": "plant", "planter": names.get(p.user_steamid, "?"),
-                                    "planter_id": pidx.get(p.user_steamid)})
-            clip_events.sort(key=lambda e: e["t"])
-            # dead players watching also get "blinded", so only keep those alive when the flash went off
-            alive_at = lambda t: set(rticks.loc[(rticks["tick"] - t).abs() <= SAMPLE_EVERY, "steamid"])
-            utility = [dict(u, by=names.get(u["by"], "?"), team="CT" if team_of.get(u["by"]) == CT_TEAM else "T",
-                            blinded=[[names.get(p, "?"), s] for p, s in u["blinded"] if p in alive_at(u["td"])])
-                       for u in throws if ft <= u["t0"] <= view_hi and u["te"] >= view_lo]
+            review, pids = clip(view_lo, view_hi, anchor)
+            review["events"] = sorted(review["events"] + [{"t": contact_tick, "type": "contact"}],
+                                      key=lambda e: e["t"])
 
             eid = len(engagements)
-            reviews.append({
-                "id": eid, "contact_tick": contact_tick, "anchor_id": pidx.get(anchor),
-                "spot": [num(spot[0]), num(spot[1])],
-                "players": [{"name": names.get(p, p), "team": "CT" if team_of.get(p) == CT_TEAM else "T",
-                             "local": p in enemies or p in mates} for p in pids],
-                "frames": frames, "events": clip_events, "utility": utility, "notes": notes,
-                "weapons": weapons, "held": holding, "bomb": bomb,
-                "round_start": ft, "plant_tick": plant_tick,
-                "bomb_end": list(bomb_end) if bomb_end else None,
-                "breakdown": [{"label": l, "value": round(v, 2), "detail": d} for l, v, d in parts],
-            })
+            reviews.append(dict(
+                review, id=eid, contact_tick=contact_tick, anchor_id=pids.index(anchor) if anchor in pids else None,
+                spot=[num(spot[0]), num(spot[1])],
+                players=[{"name": names.get(p, p), "team": "CT" if team_of.get(p) == CT_TEAM else "T",
+                          "local": p in enemies or p in mates} for p in pids],
+                notes=notes,
+                breakdown=[{"label": l, "value": round(v, 2), "detail": d} for l, v, d in parts],
+            ))
 
             engagements.append({
                 "id": eid,
@@ -680,8 +689,16 @@ def analyse(path, site_places):
                 **{f"r_{n}": round(v, 2) for n, v in sub.items()},
             })
 
+        # the whole round, for watching the full match
+        whole, pids = clip(ft, et)
+        match.append(dict(whole, winner=winner, events=sorted(whole["events"], key=lambda e: e["t"]),
+                          players=[{"name": names.get(p, p), "team": "CT" if team_of.get(p) == CT_TEAM else "T",
+                                    "local": True} for p in pids],
+                          anchors=[e["id"] for e in engagements if e["round"] == rnd]))
+
     viewer = {"map": map_name, "tickrate": TICKRATE, "local_radius": radius,
-              "background": map_background(ticks, outline=not radar_files(map_name)), "reviews": reviews}
+              "background": map_background(ticks, outline=not radar_files(map_name)), "reviews": reviews,
+              "match": match}
     return map_name, pd.DataFrame(engagements), viewer
 
 
@@ -749,10 +766,11 @@ def to_json(data):
     return json.dumps(data, default=lambda o: o.item() if hasattr(o, "item") else str(o))
 
 
-def viewer_html(data=None):
-    """The viewer page; with data embedded it works offline, without it talks to the app server."""
+def viewer_html(data=None, match=None):
+    """The viewer page; with data embedded it works offline, without it talks to the app server.
+    match (every round, for watching the full match) is embedded too when given."""
     if data is not None:
-        data = dict(data, radar=radar(data["map"], embed=True))
+        data = dict(data, radar=radar(data["map"], embed=True), **({"match": match} if match else {}))
     with open(TEMPLATE, encoding="utf-8") as f:
         return f.read().replace("__DATA__", to_json(data).replace("</", "<\\/"))
 
@@ -774,8 +792,12 @@ def summarise(eng):
     return summary.reset_index().drop(columns="steamid").sort_values("anchor_rating", ascending=False)
 
 
-def run(demo, site_places, player=None, out=None, viewer_path=None, csv=None, data_path=None, excluded=()):
+def run(demo, site_places, player=None, out=None, viewer_path=None, csv=None, data_path=None, excluded=(),
+        match_path=None):
     map_name, eng, viewer = analyse(demo, {k: set(v) for k, v in site_places.items()})
+    match = viewer.pop("match")
+    if match_path:
+        write_json(match_path, match)
     if eng.empty:
         raise ValueError("No anchor engagements found. Try --extra-places if the map uses other place names.")
     if player:
@@ -783,11 +805,18 @@ def run(demo, site_places, player=None, out=None, viewer_path=None, csv=None, da
         if eng.empty:
             raise ValueError(f"No anchor engagements for '{player}'.")
     eng["excluded"] = [engagement_key(r, p) in excluded for r, p in zip(eng["round"], eng["player"])]
-    write_results(map_name, eng, viewer_data(viewer, eng), out, viewer_path, csv, data_path)
+    write_results(map_name, eng, viewer_data(viewer, eng), out, viewer_path, csv, data_path, match=match)
     return map_name, len(eng)
 
 
-def write_results(map_name, eng, data, out=None, viewer_path=None, csv=None, data_path=None, quiet=False):
+def write_json(path, data):
+    with open(path + ".tmp", "w", encoding="utf-8") as f:
+        f.write(to_json(data))
+    os.replace(path + ".tmp", path)  # the app may be reading it
+
+
+def write_results(map_name, eng, data, out=None, viewer_path=None, csv=None, data_path=None, quiet=False,
+                  match=None):
     """Rate the engagements that aren't excluded, then write the report, viewer data and CSV."""
     say = (lambda *a: None) if quiet else print
     cols = ["round", "player", "site", "situation", "contact", "kills", "assists",
@@ -816,12 +845,10 @@ def write_results(map_name, eng, data, out=None, viewer_path=None, csv=None, dat
         rv["excluded"] = bool(excluded.get(rv["id"], False))
     if viewer_path:
         with open(viewer_path, "w", encoding="utf-8") as f:
-            f.write(viewer_html(data))
+            f.write(viewer_html(data, match))
         say(f"\nWrote 2D review viewer to {viewer_path} - open it in a browser")
     if data_path:
-        with open(data_path + ".tmp", "w", encoding="utf-8") as f:
-            f.write(to_json(data))
-        os.replace(data_path + ".tmp", data_path)  # the app may be reading it
+        write_json(data_path, data)
 
     if csv:
         eng.to_csv(csv, index=False)
@@ -842,7 +869,7 @@ def process_demo(path, site_places, player=None):
         os.remove(meta_path)  # meta.json marks a finished demo; drop it while redoing one
     map_name, n = run(path, site_places, player, out=os.path.join(out_dir, "ratings.txt"),
                       csv=os.path.join(out_dir, "engagements.csv"), data_path=os.path.join(out_dir, "data.json"),
-                      excluded=read_excluded(out_dir))
+                      excluded=read_excluded(out_dir), match_path=os.path.join(out_dir, "match.json"))
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump({"name": stem, "map": map_name, "engagements": n, "processed": time.time()}, f)
     if DELETE_DEMOS:
@@ -958,6 +985,15 @@ def load_demo(name):
         return json.load(f)
 
 
+def load_match(name):
+    """A processed demo's full-match playback, or None (demos processed before it existed have none)."""
+    try:
+        with open(os.path.join(OUTPUT_DIR, name, "match.json"), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
 class App(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
@@ -1002,8 +1038,13 @@ class App(BaseHTTPRequestHandler):
             data = load_demo(name)
             if data is not None and action == "":
                 return self.reply(200, dict(data, radar=radar(data["map"])))
+            if data is not None and action == "match":  # every round, loaded when the full match is watched
+                match = os.path.join(OUTPUT_DIR, name, "match.json")
+                if os.path.isfile(match):
+                    with open(match, "rb") as f:
+                        return self.reply(200, f.read())
             if data is not None and action == "export":  # standalone copy that works offline
-                return self.reply(200, viewer_html(data), "text/html; charset=utf-8",
+                return self.reply(200, viewer_html(data, load_match(name)), "text/html; charset=utf-8",
                                   [("Content-Disposition", f'attachment; filename="{name}.html"')])
         self.reply(404, {"error": "Not found."})
 

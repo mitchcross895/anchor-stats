@@ -32,6 +32,14 @@
   .ratings tr.row { cursor: pointer; }
   .ratings tr.row:hover, .ratings tr.sel { background: var(--panel-2); }
 
+  .tabs { display: flex; gap: 4px; margin: 18px 16px 8px; background: var(--panel-2); border-radius: 7px; padding: 3px; }
+  .tabs button { flex: 1; background: none; border: 0; border-radius: 5px; padding: 5px 8px; color: var(--muted);
+                 cursor: pointer; font-size: 12.5px; font-weight: 600; }
+  .tabs button.on { background: var(--bg); color: var(--text); }
+  .list .sc.ct { color: var(--ct); } .list .sc.t { color: var(--t); }
+  .anchors { list-style: none; margin: 0; padding: 0; }
+  .anchors li { padding: 5px 6px; border-radius: 4px; cursor: pointer; display: flex; justify-content: space-between; gap: 8px; }
+  .anchors li:hover { background: var(--panel-2); }
   .list { list-style: none; margin: 0; padding: 0 8px 16px; }
   .list li { padding: 8px 10px; border-radius: 6px; cursor: pointer; display: grid;
              grid-template-columns: 34px 1fr auto; gap: 2px 8px; align-items: center; }
@@ -142,7 +150,10 @@
     </div>
     <h2>Ratings</h2>
     <table class="ratings" id="ratings"></table>
-    <h2>Engagements</h2>
+    <div class="tabs">
+      <button id="tabFights" class="on" title="The anchor fights that were rated">Anchor fights</button>
+      <button id="tabRounds" title="Watch every round of the match">Full match</button>
+    </div>
     <ul class="list" id="list"></ul>
   </aside>
 
@@ -214,6 +225,7 @@ const cls = v => v > 0 ? 'pos' : v < 0 ? 'neg' : '';
 
 // ---------- load a demo's data
 let B = null, cell = 1, minX = 0, maxX = 1, minY = 0, maxY = 1;
+let MATCH = null, mode = 'fights';  // mode: fights (anchor engagements) | rounds (the full match)
 let radar = { upper: null, lower: null }, level = 'both';  // level: both | auto | upper | lower (two-level maps)
 let showUtil = true;
 // grenade look: colour var, effect radius in world units, seconds a burst stays visible
@@ -228,30 +240,8 @@ function load(data) {
   D = data; TR = D.tickrate;
   B = D.background; cell = B.cell || 1;
   [minX, minY, maxX, maxY] = B.bounds;
-  for (const R of D.reviews) {
-    for (const f of R.frames) f.m = new Map(f.p.map(e => [e[0], e]));
-    R.start = R.frames.length ? R.frames[0].t : R.contact_tick;
-    R.end = R.frames.length ? R.frames[R.frames.length - 1].t : R.contact_tick;
-    for (const e of R.events) {
-      e.apos = lastPos(R, e.attacker_id ?? e.planter_id, e.t);
-      e.vpos = lastPos(R, e.victim_id, e.t);
-    }
-    R.utility = R.utility || [];
-    // who each flash blinded, as [start, end] ticks per player
-    R.blinds = new Map();
-    for (const g of R.utility) {
-      if (g.kind !== 'flash') continue;
-      for (const [name, secs] of g.blinded || []) {
-        const pid = R.players.findIndex(p => p.name === name);
-        if (pid < 0) continue;
-        if (!R.blinds.has(pid)) R.blinds.set(pid, []);
-        R.blinds.get(pid).push([g.td, g.td + secs * TR]);
-      }
-    }
-    // the events list: kills, hits and the plant, plus every grenade that goes off in the clip
-    R.feed = R.events.concat(R.utility.filter(u => u.td >= R.start && u.td <= R.end)
-      .map(u => ({ t: u.td, type: 'util', u }))).sort((a, b) => a.t - b.t);
-  }
+  D.reviews.forEach(prepare);
+  MATCH = null; mode = 'fights'; setTabs();
   radar = { upper: null, lower: null }; bgKey = '';
   const img = src => { const i = new Image(); i.onload = draw; i.src = src; return i; };
   if (D.radar) {
@@ -268,12 +258,38 @@ function load(data) {
   renderRatings(); renderList(); fitMap();
   if (D.reviews.length) select(D.reviews[0].id);
 }
+// a clip (anchor fight or whole round) as the drawing code wants it
+function prepare(R) {
+  for (const f of R.frames) f.m = new Map(f.p.map(e => [e[0], e]));
+  R.start = R.frames.length ? R.frames[0].t : R.contact_tick;
+  R.end = R.frames.length ? R.frames[R.frames.length - 1].t : R.contact_tick;
+  for (const e of R.events) {
+    e.apos = lastPos(R, e.attacker_id ?? e.planter_id, e.t);
+    e.vpos = lastPos(R, e.victim_id, e.t);
+  }
+  R.utility = R.utility || [];
+  // who each flash blinded, as [start, end] ticks per player
+  R.blinds = new Map();
+  for (const g of R.utility) {
+    if (g.kind !== 'flash') continue;
+    for (const [name, secs] of g.blinded || []) {
+      const pid = R.players.findIndex(p => p.name === name);
+      if (pid < 0) continue;
+      if (!R.blinds.has(pid)) R.blinds.set(pid, []);
+      R.blinds.get(pid).push([g.td, g.td + secs * TR]);
+    }
+  }
+  // the events list: kills, the plant (and the anchor's hits), plus every grenade that goes off in the clip
+  const isRound = R.contact_tick == null;
+  R.feed = R.events.filter(e => !(isRound && e.type === 'hurt'))
+    .concat(R.utility.filter(g => g.td >= R.start && g.td <= R.end).map(g => ({ t: g.td, type: 'util', u: g })))
+    .sort((a, b) => a.t - b.t);
+}
 function lastPos(R, pid, t) {
   if (pid == null) return null;
-  for (let i = R.frames.length - 1; i >= 0; i--) {
-    const f = R.frames[i];
-    if (f.t > t) continue;
-    const e = f.m.get(pid);
+  const fa = R.frames.length && t >= R.frames[0].t ? frameAt(t, R) : null;
+  for (let i = fa ? fa[0] : -1; i >= 0; i--) {
+    const e = R.frames[i].m.get(pid);
     if (e) return [e[1], e[2], e[5]];
   }
   return null;
@@ -308,7 +324,7 @@ function fitBox(x0, y0, x1, y1) {
 }
 const fitMap = () => fitBox(minX, minY, maxX + (split ? lowerDX : 0), maxY);
 function focusFight() {
-  if (!R) return fitMap();
+  if (!R || !R.spot) return fitMap();
   const start = lastPos(R, R.anchor_id, R.contact_tick) || [];  // the spot has no height; use the anchor's
   const pts = [[wx(R.spot[0], start[2]), R.spot[1]]];
   for (const f of R.frames) {
@@ -324,8 +340,8 @@ function focusFight() {
 }
 
 // ---------- interpolation
-function frameAt(t) {
-  const f = R.frames, n = f.length;
+function frameAt(t, clip = R) {
+  const f = clip.frames, n = f.length;
   if (!n) return null;
   if (t <= f[0].t) return [0, 0, 0];
   if (t >= f[n - 1].t) return [n - 1, n - 1, 0];
@@ -430,12 +446,14 @@ function render() {
   drawMap(shown);
   if (!R) return;
 
-  // local-area ring
-  const ringAt = anchor || { x: R.spot[0], y: R.spot[1] };
-  ctx.save();
-  ctx.setLineDash([6, 6]); ctx.strokeStyle = cur >= R.contact_tick ? C.contact : C.muted; ctx.globalAlpha = .55; ctx.lineWidth = 1.5;
-  ctx.beginPath(); ctx.arc(sx(wx(ringAt.x, ringAt.z)), sy(ringAt.y), D.local_radius * view.s, 0, Math.PI * 2); ctx.stroke();
-  ctx.restore();
+  // local-area ring (anchor fights only)
+  if (R.spot) {
+    const ringAt = anchor || { x: R.spot[0], y: R.spot[1] };
+    ctx.save();
+    ctx.setLineDash([6, 6]); ctx.strokeStyle = cur >= R.contact_tick ? C.contact : C.muted; ctx.globalAlpha = .55; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(sx(wx(ringAt.x, ringAt.z)), sy(ringAt.y), D.local_radius * view.s, 0, Math.PI * 2); ctx.stroke();
+    ctx.restore();
+  }
 
   if (showUtil) drawUtility();
   drawTrails(pos, onShown);
@@ -613,11 +631,13 @@ function renderRatings() {
       <td class="${cls(r.anchor_rating - 1)}"><b>${r.anchor_rating.toFixed(2)}</b></td></tr>`).join('');
   $('ratings').innerHTML = `<tr><th>Player</th><th>Fights</th><th>K/exp</th><th>Rating</th></tr>${rows}`;
   $('ratings').querySelectorAll('tr.row').forEach(tr => tr.onclick = () => {
-    filter = filter === tr.dataset.p ? null : tr.dataset.p; renderRatings(); renderList();
+    filter = filter === tr.dataset.p ? null : tr.dataset.p; renderRatings();
+    if (mode === 'rounds') $('tabFights').click(); else renderList();
   });
 }
 function visible() { return D.reviews.filter(r => !filter || r.player === filter); }
 function renderList() {
+  if (mode === 'rounds') return renderRounds();
   $('list').innerHTML = visible().map(r => `<li data-id="${r.id}" class="${R && R.id === r.id ? 'on' : ''} ${r.excluded ? 'out' : ''}"
       title="${r.excluded ? 'Excluded from the rating' : ''}">
       <span class="r">R${r.round}</span><span class="who">${esc(shortName(r.player))}</span>
@@ -626,8 +646,85 @@ function renderList() {
   $('list').querySelectorAll('li').forEach(li => li.onclick = () => select(+li.dataset.id));
 }
 
+// ---------- full match: every round, loaded the first time it's opened
+function setTabs() {
+  $('tabFights').classList.toggle('on', mode === 'fights');
+  $('tabRounds').classList.toggle('on', mode === 'rounds');
+  $('tocontact').hidden = mode === 'rounds';
+  $('focus').hidden = mode === 'rounds';
+}
+async function showRounds() {
+  if (!MATCH) {
+    $('list').innerHTML = '<li class="hint">Loading the match...</li>';
+    try {
+      let rounds = D.match;
+      if (!rounds && D.name) {
+        const r = await fetch(`/api/demos/${encodeURIComponent(D.name)}/match`);
+        if (r.status === 404) throw new Error('This demo was processed before full-match playback existed. Upload it again to watch it.');
+        if (!r.ok) throw new Error(r.statusText);
+        rounds = await r.json();
+      }
+      if (!rounds) throw new Error('This copy has no full-match playback. Download the offline copy again from the app.');
+      rounds.forEach(prepare);
+      MATCH = rounds;
+    } catch (e) {
+      $('list').innerHTML = `<li class="hint">${esc(e.message === 'Failed to fetch' ? OFFLINE : e.message)}</li>`;
+      return;
+    }
+  }
+  mode = 'rounds'; setTabs();
+  selectRound(0);
+}
+function renderRounds() {
+  $('list').innerHTML = MATCH.map((r, i) => {
+    const kills = r.events.filter(e => e.type === 'kill').length;
+    const bomb = r.bomb_end ? `bomb ${r.bomb_end[1]}` : r.plant_tick != null ? 'bomb planted' : '';
+    return `<li data-i="${i}" class="${R === r ? 'on' : ''}">
+      <span class="r">R${r.round}</span><span class="who">${r.winner ? r.winner + ' win' : 'No result'}</span>
+      <span class="sc ${(r.winner || '').toLowerCase()}">${r.winner || ''}</span>
+      <span class="meta">${kills} kills${bomb ? ' · ' + bomb : ''}${r.anchors.length ? ` · ${r.anchors.length} anchor fight${r.anchors.length > 1 ? 's' : ''}` : ''}</span></li>`;
+  }).join('');
+  $('list').querySelectorAll('li').forEach(li => li.onclick = () => selectRound(+li.dataset.i));
+}
+// keepView: carry on with the same zoom when playback runs on into the next round
+function selectRound(i, keepView) {
+  R = MATCH[i];
+  $('scrub').min = R.start; $('scrub').max = R.end;
+  renderRounds(); renderRoundNotes(); renderMarks();
+  if (!keepView) fitMap();
+  seek(R.start);
+  setPlaying(true);
+}
+function renderRoundNotes() {
+  const fights = R.anchors.map(id => D.reviews.find(r => r.id === id)).filter(Boolean);
+  const kills = R.events.filter(e => e.type === 'kill');
+  const deaths = team => kills.filter(e => (R.players[e.victim_id] || {}).team === team).length;
+  $('notes').innerHTML = `
+    <div class="head">
+      <div><div class="title">Round ${R.round}</div>
+        <div class="badges"><span class="badge">${R.winner ? R.winner + ' win' : 'No result'}</span>
+          ${R.bomb_end ? `<span class="badge">Bomb ${R.bomb_end[1]}</span>` : R.plant_tick != null ? '<span class="badge">Bomb planted</span>' : ''}
+          <span class="badge">${deaths('T')} T / ${deaths('CT')} CT died</span></div></div>
+    </div>
+    <h2>Anchor fights this round</h2>
+    ${fights.length ? `<ul class="anchors">${fights.map(f => `<li data-id="${f.id}"><span>${esc(shortName(f.player))} on ${f.site} · ${f.situation}</span>
+        <b class="${cls(f.score)}">${fmt(f.score)}</b></li>`).join('')}</ul>` : '<p class="hint">No anchor fights were rated this round.</p>'}
+    <h2>Events</h2>
+    <ul class="feed" id="feed">${R.feed.map((e, i) => `<li data-i="${i}" class="${e.type === 'util' ? 'util' : ''}"><span class="tm">${rel(e.t)}</span><span>${eventText(e)}</span></li>`).join('')}</ul>
+    <p class="hint" style="margin-top:16px">Playback runs on into the next round. Click a fight above to see how it was rated.</p>`;
+  $('feed').querySelectorAll('li').forEach(li => li.onclick = () => { seek(R.feed[+li.dataset.i].t - 2 * TR); });
+  $('notes').querySelectorAll('.anchors li').forEach(li => li.onclick = () => {
+    mode = 'fights'; setTabs(); select(+li.dataset.id);
+  });
+  updateFeed(true);
+}
+
 // ---------- UI: notes
-function rel(t) { const s = (t - R.contact_tick) / TR; return (s >= 0 ? '+' : '') + s.toFixed(1) + 's'; }
+// times: relative to first contact in an anchor fight, round time elapsed in a full round
+function rel(t) {
+  if (R.contact_tick == null) return mmss((t - R.round_start) / TR);
+  const s = (t - R.contact_tick) / TR; return (s >= 0 ? '+' : '') + s.toFixed(1) + 's';
+}
 function eventText(e) {
   if (e.type === 'contact') return '<b>First contact</b>';
   if (e.type === 'plant') return `${esc(shortName(e.planter))} planted the bomb`;
@@ -684,8 +781,10 @@ function updateFeed(force) {
 function renderMarks() {
   const span = Math.max(1, R.end - R.start);
   $('marks').innerHTML = R.events.filter(e => e.type !== 'hurt').map(e => {
+    const victim = R.players[e.victim_id];
     const col = e.type === 'contact' ? 'var(--contact)' : e.type === 'plant' ? 'var(--bad)'
-      : e.by_anchor ? 'var(--good)' : e.anchor_died ? 'var(--bad)' : 'var(--muted)';
+      : e.by_anchor ? 'var(--good)' : e.anchor_died ? 'var(--bad)'
+      : R.spot || !victim ? 'var(--muted)' : `var(--${victim.team.toLowerCase()})`;
     return `<span class="mark" title="${e.type}" style="left:${(e.t - R.start) / span * 100}%;background:${col}"></span>`;
   }).join('');
 }
@@ -709,9 +808,10 @@ function clockText() {
     else time = mmss(sec(R.round_start + ROUND_TIME * TR));
     time += ' · ';
   }
-  return `Round ${R.round} · ${time}contact ${rel(cur)}`;
+  return R.contact_tick == null ? `Round ${R.round} · ${time.slice(0, -3)}` : `Round ${R.round} · ${time}contact ${rel(cur)}`;
 }
 function select(id) {
+  if (mode !== 'fights') { mode = 'fights'; setTabs(); }
   R = D.reviews.find(r => r.id === id);
   $('scrub').min = R.start; $('scrub').max = R.end;
   renderList(); renderNotes(); renderMarks();
@@ -721,6 +821,7 @@ function select(id) {
 }
 function step(dir) {
   if (!R) return;
+  if (mode === 'rounds') return selectRound((MATCH.indexOf(R) + dir + MATCH.length) % MATCH.length);
   const v = visible(), i = v.findIndex(r => r.id === R.id);
   const n = v[(i + dir + v.length) % v.length];
   if (n) select(n.id);
@@ -732,8 +833,9 @@ let last = performance.now();
 function tick(now) {
   const dt = Math.min(0.1, (now - last) / 1000); last = now;
   if (playing && R) {
-    if (cur >= R.end) setPlaying(false);
-    else seek(cur + dt * TR * speed);
+    if (cur < R.end) seek(cur + dt * TR * speed);
+    else if (mode === 'rounds' && MATCH.indexOf(R) < MATCH.length - 1) selectRound(MATCH.indexOf(R) + 1, true);
+    else setPlaying(false);
   }
   if (dirty) render();
   requestAnimationFrame(tick);
@@ -742,7 +844,14 @@ function tick(now) {
 $('play').onclick = () => { if (R && cur >= R.end) seek(R.start); setPlaying(!playing); };
 $('prev').onclick = () => step(-1);
 $('next').onclick = () => step(1);
-$('tocontact').onclick = () => R && seek(R.contact_tick);
+$('tocontact').onclick = () => R && R.contact_tick != null && seek(R.contact_tick);
+$('tabFights').onclick = () => {
+  if (mode === 'fights' || !D) return;
+  mode = 'fights'; setTabs();
+  const v = visible(); renderList();
+  if (v.length) select(v[0].id);
+};
+$('tabRounds').onclick = () => { if (mode !== 'rounds' && D) showRounds(); };
 $('speed').onchange = e => speed = +e.target.value;
 $('fit').onclick = fitMap;
 $('focus').onclick = focusFight;
