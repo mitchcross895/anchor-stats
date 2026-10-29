@@ -53,7 +53,6 @@ The viewer draws the real radar for the Premier maps: Inferno, Mirage, Dust 2, C
 
 Each player shows:
 - the direction they're looking, as a short line and a faint view cone
-- a fading trail of where they've been over the last 2 seconds
 - their health bar and the weapon in their hand
 - a white dot while they're flashed
 - a small red tag if they're carrying the bomb (a dropped bomb shows where it fell)

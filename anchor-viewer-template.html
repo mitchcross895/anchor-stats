@@ -383,7 +383,6 @@ let dirty = true;
 const draw = () => { dirty = true; };
 let u = 1;  // marker scale: 1 at the "Focus fight" zoom, so markers keep their size relative to the map
 const PLAYER_SCALE = 0.22;  // screen pixels per map unit at which markers are drawn at their base size
-const TRAIL = 2;            // seconds of movement trail behind each player
 const ROUND_TIME = 115, BOMB_TIME = 40;  // seconds: round timer after freeze time, bomb fuse
 
 // the map layer only changes when the view does, so it's rendered once and copied each frame
@@ -456,7 +455,6 @@ function render() {
   }
 
   if (showUtil) drawUtility();
-  drawTrails(pos, onShown);
 
   // events: death markers, shot lines, bomb
   for (const e of R.events) {
@@ -536,31 +534,6 @@ function blindness(pid) {
     if (cur >= t0 && cur <= t1) k = Math.max(k, Math.min(1, (t1 - cur) / TR));
   }
   return k;
-}
-
-// a fading line through where each player was over the last TRAIL seconds
-function drawTrails(pos, onShown) {
-  const fa = frameAt(cur);
-  if (!fa) return;
-  const from = cur - TRAIL * TR;
-  let i0 = fa[0];
-  while (i0 > 0 && R.frames[i0 - 1].t >= from) i0--;
-  ctx.lineCap = 'round'; ctx.lineWidth = 2 * u;
-  for (const [pid, p] of pos) {
-    const pl = R.players[pid];
-    const pts = [];
-    for (let i = i0; i <= fa[0]; i++) { const e = R.frames[i].m.get(pid); if (e) pts.push([R.frames[i].t, e[1], e[2], e[5]]); }
-    pts.push([cur, p.x, p.y, p.z]);
-    const base = (pl.local || pid === R.anchor_id ? 0.6 : 0.25) * (onShown(p) ? 1 : 0.35);
-    ctx.strokeStyle = pl.team === 'CT' ? C.ct : C.t;
-    for (let i = 1; i < pts.length; i++) {
-      const [ta, xa, ya, za] = pts[i - 1], [, xb, yb, zb] = pts[i];
-      if (split && isLower(za) !== isLower(zb)) continue;  // changed level: don't draw across the gap
-      ctx.globalAlpha = base * Math.max(0, (ta - from) / (TRAIL * TR));
-      ctx.beginPath(); ctx.moveTo(sx(wx(xa, za)), sy(ya)); ctx.lineTo(sx(wx(xb, zb)), sy(yb)); ctx.stroke();
-    }
-  }
-  ctx.lineCap = 'butt'; ctx.globalAlpha = 1;
 }
 
 // grenades: a trail while in the air, then the effect where it landed
