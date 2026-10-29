@@ -39,13 +39,25 @@ python anchor-stats.py --batch --force          # ...including ones already done
 python anchor-stats.py match.dem --viewer review.html --out ratings.txt --csv fights.csv
 python anchor-stats.py match.dem --player "Paladin"
 python anchor-stats.py --extra-places "B:Bench,Market"   # count extra nav places as a site
+python anchor-stats.py --delete-demos           # delete each .dem once it's processed, to save space
 ```
+
+Demos are big (200-400 MB each) and the results are tiny, so `--delete-demos` (for example `run.bat --delete-demos`) deletes each `.dem` once its results are saved. You can't reprocess a deleted demo, for example after changing a setting, unless you upload it again.
 
 The viewer app only listens on this computer (`127.0.0.1`), so nobody else on your network can reach it.
 
 ## Maps
 
-The viewer draws the real radar for the Premier maps: Inferno, Mirage, Dust 2, Cache, Nuke, Anubis and Ancient. On Nuke, it follows the anchor between the upper and lower levels; use the **Level** button to pick one yourself. Any other map falls back to an outline traced from where players stood. See [maps/README.md](maps/README.md) to add more maps.
+The viewer draws the real radar for the Premier maps: Inferno, Mirage, Dust 2, Cache, Nuke, Anubis and Ancient. On Nuke, the upper and lower levels are shown side by side and each player appears on the level they're on. Use the **Level** button to show one level at a time, either following the anchor (`auto`) or picked yourself. Any other map falls back to an outline traced from where players stood. See [maps/README.md](maps/README.md) to add more maps.
+
+Each player shows:
+- the direction they're looking, as a short line and a faint view cone
+- a fading trail of where they've been over the last 2 seconds
+- their health bar and the weapon in their hand
+- a white dot while they're flashed
+- a small red tag if they're carrying the bomb (a dropped bomb shows where it fell)
+
+The clock in the top left shows the round time, and the bomb timer once it's planted. Players and markers keep their size relative to the map as you zoom.
 
 Utility is shown too:
 - **Grenades in flight** leave a trail in the thrower's team colour.

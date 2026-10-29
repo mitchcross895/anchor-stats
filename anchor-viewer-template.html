@@ -49,6 +49,7 @@
   .stage { position: relative; flex: 1; min-height: 0; }
   canvas { position: absolute; inset: 0; width: 100%; height: 100%; cursor: grab; }
   canvas.drag { cursor: grabbing; }
+  .clock .bomb { color: var(--bad); }
   .clock { position: absolute; top: 12px; left: 14px; background: rgba(16,19,23,.8); padding: 6px 10px;
            border-radius: 6px; font-variant-numeric: tabular-nums; font-size: 13px; pointer-events: none; }
   .legend { position: absolute; top: 12px; right: 14px; background: rgba(16,19,23,.8); padding: 6px 10px;
@@ -154,6 +155,8 @@
         <span><span class="dot" style="background:var(--t)"></span>T</span>
         <span><span class="dot" style="background:var(--anchor)"></span>Anchor</span>
         <span>dashed ring = local area</span>
+        <span><span class="dot" style="background:var(--bad);border-radius:2px"></span>C4</span>
+        <span><span class="dot" style="background:#fff"></span>flashed</span>
         <span class="util-key"><span class="dot" style="background:var(--smoke)"></span>smoke
           <span class="dot" style="background:var(--fire);margin-left:6px"></span>fire
           <span class="dot" style="background:var(--flash);margin-left:6px"></span>flash
@@ -211,7 +214,7 @@ const cls = v => v > 0 ? 'pos' : v < 0 ? 'neg' : '';
 
 // ---------- load a demo's data
 let B = null, cell = 1, minX = 0, maxX = 1, minY = 0, maxY = 1;
-let radar = { upper: null, lower: null }, level = 'auto';  // level: auto | upper | lower (two-level maps)
+let radar = { upper: null, lower: null }, level = 'both';  // level: both | auto | upper | lower (two-level maps)
 let showUtil = true;
 // grenade look: colour var, effect radius in world units, seconds a burst stays visible
 const UTIL = {
@@ -234,6 +237,17 @@ function load(data) {
       e.vpos = lastPos(R, e.victim_id, e.t);
     }
     R.utility = R.utility || [];
+    // who each flash blinded, as [start, end] ticks per player
+    R.blinds = new Map();
+    for (const g of R.utility) {
+      if (g.kind !== 'flash') continue;
+      for (const [name, secs] of g.blinded || []) {
+        const pid = R.players.findIndex(p => p.name === name);
+        if (pid < 0) continue;
+        if (!R.blinds.has(pid)) R.blinds.set(pid, []);
+        R.blinds.get(pid).push([g.td, g.td + secs * TR]);
+      }
+    }
     // the events list: kills, hits and the plant, plus every grenade that goes off in the clip
     R.feed = R.events.concat(R.utility.filter(u => u.td >= R.start && u.td <= R.end)
       .map(u => ({ t: u.td, type: 'util', u }))).sort((a, b) => a.t - b.t);
@@ -244,7 +258,10 @@ function load(data) {
     radar.upper = img(D.radar.image);
     if (D.radar.lower) radar.lower = img(D.radar.lower.image);
   }
-  level = 'auto'; $('level').hidden = !radar.lower; $('level').textContent = 'Level: auto';
+  // two-level maps open with both levels side by side (radar images are 1024 px square)
+  below = D.radar && D.radar.lower ? D.radar.lower.below : null;
+  lowerDX = below == null ? 0 : 1024 * D.radar.scale + LEVEL_GAP;
+  setLevel('both'); $('level').hidden = !radar.lower;
   R = null; filter = null; setPlaying(false);
   $('empty').hidden = true;
   $('mapname').textContent = `${D.map} · ${D.reviews.length} anchor engagements`;
@@ -257,7 +274,7 @@ function lastPos(R, pid, t) {
     const f = R.frames[i];
     if (f.t > t) continue;
     const e = f.m.get(pid);
-    if (e) return [e[1], e[2]];
+    if (e) return [e[1], e[2], e[5]];
   }
   return null;
 }
@@ -278,18 +295,25 @@ function resize() {
 const sx = x => W / 2 + (x - view.x) * view.s;
 const sy = y => H / 2 - (y - view.y) * view.s;
 
+// two-level maps (Nuke): side by side, the lower level is drawn again to the right of the upper one
+const LEVEL_GAP = 300;  // world units between the two levels in the side-by-side view
+let below = null, lowerDX = 0, split = false;
+const isLower = z => below != null && z != null && z < below;
+const wx = (x, z) => split && isLower(z) ? x + lowerDX : x;  // world x, moved onto the lower copy when split
+
 function fitBox(x0, y0, x1, y1) {
   view.x = (x0 + x1) / 2; view.y = (y0 + y1) / 2;
   view.s = Math.min(W / (x1 - x0), H / (y1 - y0)) * 0.92;
   draw();
 }
-const fitMap = () => fitBox(minX, minY, maxX, maxY);
+const fitMap = () => fitBox(minX, minY, maxX + (split ? lowerDX : 0), maxY);
 function focusFight() {
   if (!R) return fitMap();
-  const pts = [R.spot];
+  const start = lastPos(R, R.anchor_id, R.contact_tick) || [];  // the spot has no height; use the anchor's
+  const pts = [[wx(R.spot[0], start[2]), R.spot[1]]];
   for (const f of R.frames) {
     if (Math.abs(f.t - R.contact_tick) > 6 * TR) continue;
-    for (const e of f.p) if (R.players[e[0]].local || e[0] === R.anchor_id) pts.push([e[1], e[2]]);
+    for (const e of f.p) if (R.players[e[0]].local || e[0] === R.anchor_id) pts.push([wx(e[1], e[5]), e[2]]);
   }
   let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
   for (const [x, y] of pts) { x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x); y1 = Math.max(y1, y); }
@@ -309,7 +333,7 @@ function frameAt(t) {
   while (hi - lo > 1) { const m = (lo + hi) >> 1; if (f[m].t <= t) lo = m; else hi = m; }
   return [lo, hi, (t - f[lo].t) / (f[hi].t - f[lo].t)];
 }
-// samples are 0.25 s apart: a Catmull-Rom curve through them avoids the jolt at each sample
+// samples are 0.125 s apart: a Catmull-Rom curve through them avoids the jolt at each sample
 const near = (a, b) => b + (((a - b + 540) % 360) - 180);  // angle a, unwrapped next to angle b
 function spline(p0, p1, p2, p3, k) {
   return p1 + 0.5 * k * (p2 - p0 + k * (2 * p0 - 5 * p1 + 4 * p2 - p3 + k * (3 * (p1 - p2) + p3 - p0)));
@@ -325,45 +349,68 @@ function positions(t) {
       const p = Pm.get(pid) || e, q = Nm.get(pid) || n;
       const y1 = near(n[3], e[3]), y0 = near(p[3], e[3]), y2 = near(q[3], y1);
       out.set(pid, { x: spline(p[1], e[1], n[1], q[1], k), y: spline(p[2], e[2], n[2], q[2], k),
-                     yaw: spline(y0, e[3], y1, y2, k), hp: n[4], z: n[5] });
+                     yaw: spline(y0, e[3], y1, y2, k), hp: n[4], z: k < 0.5 ? e[5] : n[5] });
     } else if (a === b || k < 0.5) out.set(pid, { x: e[1], y: e[2], yaw: e[3], hp: e[4], z: e[5] });
   }
   return out;
+}
+// the last entry of a [[tick, ...], ...] list at or before t
+function stateAt(list, t) {
+  let s = null;
+  for (const e of list || []) { if (e[0] > t) break; s = e; }
+  return s;
 }
 
 // ---------- drawing
 // draw() just asks for a frame; the animation loop renders at most once per screen refresh
 let dirty = true;
 const draw = () => { dirty = true; };
+let u = 1;  // marker scale: 1 at the "Focus fight" zoom, so markers keep their size relative to the map
+const PLAYER_SCALE = 0.22;  // screen pixels per map unit at which markers are drawn at their base size
+const TRAIL = 2;            // seconds of movement trail behind each player
+const ROUND_TIME = 115, BOMB_TIME = 40;  // seconds: round timer after freeze time, bomb fuse
 
 // the map layer only changes when the view does, so it's rendered once and copied each frame
 const bgCv = document.createElement('canvas'), bgCtx = bgCv.getContext('2d');
 let bgKey = '';
 function drawMap(shown) {
-  const dpr = window.devicePixelRatio || 1, img = radar[shown];
-  const key = [D.map, shown, view.x, view.y, view.s, W, H, dpr, img && img.complete].join();
+  const dpr = window.devicePixelRatio || 1;
+  const layers = split ? [['upper', 0], ['lower', lowerDX]] : [[shown, 0]];
+  const key = [D.map, split, shown, view.x, view.y, view.s, W, H, dpr,
+               ...layers.map(([l]) => radar[l] && radar[l].complete)].join();
   if (key !== bgKey) {
     bgKey = key;
     bgCv.width = cv.width; bgCv.height = cv.height;
     const c = bgCtx;
     c.setTransform(dpr, 0, 0, dpr, 0, 0);
     c.fillStyle = C.bg; c.fillRect(0, 0, W, H);
-    if (img && img.complete && img.naturalWidth) {
-      // radar overview: pos_x/pos_y is the image's top-left corner in world units, scale = units per pixel
-      const s = D.radar.scale * view.s;
-      c.imageSmoothingQuality = 'high';
-      c.drawImage(img, sx(D.radar.pos_x), sy(D.radar.pos_y), img.naturalWidth * s, img.naturalHeight * s);
-    } else if (B.cells) {
-      // no radar for this map: outline it from where players stood
-      c.fillStyle = C.map;
-      const cs = cell * view.s + 0.6;
-      for (const [x, y] of B.cells) c.fillRect(sx(x * cell), sy((y + 1) * cell), cs, cs);
+    const hasImg = !!radar[shown];
+    for (const [l, dx] of layers) {
+      const img = radar[l];
+      if (img && img.complete && img.naturalWidth) {
+        // radar overview: pos_x/pos_y is the image's top-left corner in world units, scale = units per pixel
+        const s = D.radar.scale * view.s;
+        c.imageSmoothingQuality = 'high';
+        c.drawImage(img, sx(D.radar.pos_x + dx), sy(D.radar.pos_y), img.naturalWidth * s, img.naturalHeight * s);
+        if (split) {
+          c.font = '700 13px system-ui, sans-serif'; c.textAlign = 'left'; c.fillStyle = C.muted;
+          c.fillText(l === 'upper' ? 'UPPER LEVEL' : 'LOWER LEVEL', sx(D.radar.pos_x + dx) + 10, sy(D.radar.pos_y) + 20);
+        }
+      } else if (B.cells && !hasImg) {
+        // no radar for this map: outline it from where players stood
+        c.fillStyle = C.map;
+        const cs = cell * view.s + 0.6;
+        for (const [x, y] of B.cells) c.fillRect(sx(x * cell), sy((y + 1) * cell), cs, cs);
+      }
     }
     // place labels (radars have no callouts)
     c.font = '600 11px system-ui, sans-serif'; c.textAlign = 'center';
-    c.lineWidth = 3; c.strokeStyle = 'rgba(0,0,0,.55)'; c.fillStyle = img ? C.text : C['map-label'];
-    c.globalAlpha = img ? 0.6 : 1;
-    for (const l of B.labels) { c.strokeText(l.name, sx(l.x), sy(l.y)); c.fillText(l.name, sx(l.x), sy(l.y)); }
+    c.lineWidth = 3; c.strokeStyle = 'rgba(0,0,0,.55)'; c.fillStyle = hasImg ? C.text : C['map-label'];
+    c.globalAlpha = hasImg ? 0.6 : 1;
+    for (const l of B.labels) {
+      const x = sx(wx(l.x, l.z)), y = sy(l.y);
+      c.strokeText(l.name, x, y); c.fillText(l.name, x, y);
+    }
     c.globalAlpha = 1;
   }
   ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.drawImage(bgCv, 0, 0); ctx.restore();
@@ -372,13 +419,13 @@ function drawMap(shown) {
 function render() {
   dirty = false;
   if (!D) { ctx.fillStyle = C.bg; ctx.fillRect(0, 0, W, H); return; }
+  u = view.s / PLAYER_SCALE;
   const pos = R ? positions(cur) : new Map();
   const anchor = R ? pos.get(R.anchor_id) : null;
-  // two-level maps: follow the anchor unless a level was picked
-  const below = D.radar && D.radar.lower ? D.radar.lower.below : null;
-  const shown = below == null ? 'upper'
-    : level !== 'auto' ? level : anchor && anchor.z != null && anchor.z < below ? 'lower' : 'upper';
-  const onShown = p => below == null || p.z == null || (p.z < below) === (shown === 'lower');
+  // two-level maps, one level at a time: follow the anchor unless a level was picked
+  const shown = below == null || split ? 'upper'
+    : level !== 'auto' ? level : anchor && isLower(anchor.z) ? 'lower' : 'upper';
+  const onShown = p => below == null || split || p.z == null || isLower(p.z) === (shown === 'lower');
 
   drawMap(shown);
   if (!R) return;
@@ -387,10 +434,11 @@ function render() {
   const ringAt = anchor || { x: R.spot[0], y: R.spot[1] };
   ctx.save();
   ctx.setLineDash([6, 6]); ctx.strokeStyle = cur >= R.contact_tick ? C.contact : C.muted; ctx.globalAlpha = .55; ctx.lineWidth = 1.5;
-  ctx.beginPath(); ctx.arc(sx(ringAt.x), sy(ringAt.y), D.local_radius * view.s, 0, Math.PI * 2); ctx.stroke();
+  ctx.beginPath(); ctx.arc(sx(wx(ringAt.x, ringAt.z)), sy(ringAt.y), D.local_radius * view.s, 0, Math.PI * 2); ctx.stroke();
   ctx.restore();
 
   if (showUtil) drawUtility();
+  drawTrails(pos, onShown);
 
   // events: death markers, shot lines, bomb
   for (const e of R.events) {
@@ -398,98 +446,163 @@ function render() {
     const age = (cur - e.t) / TR;
     if (e.type === 'kill' && e.vpos) {
       const victim = R.players[e.victim_id];
-      drawX(e.vpos[0], e.vpos[1], victim ? (victim.team === 'CT' ? C.ct : C.t) : C.muted, e.anchor_died);
+      drawX(e.vpos, victim ? (victim.team === 'CT' ? C.ct : C.t) : C.muted, e.anchor_died);
       if (age < 1.5 && e.apos) line(e.apos, e.vpos, e.by_anchor ? C.good : C.bad, 2.5, 1 - age / 1.5);
     } else if (e.type === 'hurt' && age < 0.6 && e.apos && e.vpos) {
       line(e.apos, e.vpos, e.by_anchor ? C.good : C.bad, 1.2, 0.8 * (1 - age / 0.6));
     } else if (e.type === 'plant' && e.apos) {
-      const x = sx(e.apos[0]), y = sy(e.apos[1]);
-      ctx.fillStyle = C.bad; ctx.fillRect(x - 6, y - 6, 12, 12);
-      ctx.fillStyle = C.bg; ctx.font = '700 10px system-ui'; ctx.textAlign = 'center'; ctx.fillText('C4', x, y + 3.5);
+      drawC4(e.apos, 1);
     }
   }
+  // a dropped bomb lies where it was dropped
+  const bomb = stateAt(R.bomb, cur);
+  if (bomb && bomb[1] == null && bomb[2] != null) {
+    const at = lastPos(R, bomb[2], bomb[0]);
+    if (at) drawC4(at, 0.8);
+  }
+  const carrier = bomb ? bomb[1] : null;
 
   // players: sized in map units, so they keep their size relative to the map at any zoom
-  // (u = 1 at the "Focus fight" zoom; names stay readable at every zoom)
-  const u = view.s / PLAYER_SCALE, font = Math.max(9, Math.min(15, 11 * u));
+  const font = Math.max(9, Math.min(15, 11 * u)), small = Math.max(8, Math.min(13, 9.5 * u));
   for (const [pid, p] of pos) {
     const pl = R.players[pid], isA = pid === R.anchor_id;
     const col = pl.team === 'CT' ? C.ct : C.t;
-    const x = sx(p.x), y = sy(p.y), r = (isA ? 8 : 6) * u;
+    const x = sx(wx(p.x, p.z)), y = sy(p.y), r = (isA ? 8 : 6) * u;
     const a = p.yaw * Math.PI / 180;
-    ctx.globalAlpha = (pl.local || isA ? 1 : 0.45) * (onShown(p) ? 1 : 0.35);
+    const base = (pl.local || isA ? 1 : 0.45) * (onShown(p) ? 1 : 0.35);
+    ctx.globalAlpha = base;
     // where they're looking: a faint view cone and a line down the middle
     const cone = r + 46 * u, half = 0.5;
-    ctx.fillStyle = col; ctx.globalAlpha *= 0.18;
+    ctx.fillStyle = col; ctx.globalAlpha = base * 0.18;
     ctx.beginPath(); ctx.moveTo(x, y); ctx.arc(x, y, cone, -a - half, -a + half); ctx.closePath(); ctx.fill();
-    ctx.globalAlpha /= 0.18;
+    ctx.globalAlpha = base;
     ctx.strokeStyle = col; ctx.lineWidth = 4.5 * u; ctx.lineCap = 'round';
     ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + Math.cos(a) * (r + 11 * u), y - Math.sin(a) * (r + 11 * u)); ctx.stroke();
     ctx.lineCap = 'butt';
     ctx.fillStyle = col; ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
+    // flashed: the dot turns white, fading back over the last second of the blind
+    const blind = blindness(pid);
+    if (blind > 0) {
+      ctx.globalAlpha = base * blind; ctx.fillStyle = '#fff';
+      ctx.beginPath(); ctx.arc(x, y, r * 0.8, 0, Math.PI * 2); ctx.fill();
+      ctx.globalAlpha = base;
+    }
     if (isA) { ctx.strokeStyle = C.anchor; ctx.lineWidth = 2.5 * u; ctx.beginPath(); ctx.arc(x, y, r + 3 * u, 0, Math.PI * 2); ctx.stroke(); }
+    if (pid === carrier) {  // bomb carrier: a small C4 tag on the dot
+      const s = 4.5 * u;
+      ctx.fillStyle = C.bad; ctx.strokeStyle = C.bg; ctx.lineWidth = Math.max(1, u);
+      ctx.fillRect(x + r * 0.4, y + r * 0.1, s * 1.6, s); ctx.strokeRect(x + r * 0.4, y + r * 0.1, s * 1.6, s);
+    }
     // health bar
     const bw = 20 * u, by = y + r + 4 * u;
     ctx.fillStyle = 'rgba(0,0,0,.6)'; ctx.fillRect(x - bw / 2, by, bw, 3 * u);
     ctx.fillStyle = p.hp > 50 ? C.good : p.hp > 20 ? C.contact : C.bad; ctx.fillRect(x - bw / 2, by, bw * Math.max(0, p.hp) / 100, 3 * u);
-    // name
-    ctx.fillStyle = isA ? C.anchor : C.text; ctx.font = (isA ? '700 ' : '500 ') + font + 'px system-ui'; ctx.textAlign = 'left';
+    // name, and what they're holding
+    ctx.textAlign = 'left';
+    ctx.fillStyle = isA ? C.anchor : C.text; ctx.font = (isA ? '700 ' : '500 ') + font + 'px system-ui';
     ctx.fillText(shortName(pl.name), x + r + 5 * u, y - r);
+    const held = stateAt(R.held && R.held[pid], cur);
+    if (held && held[1] != null) {
+      ctx.fillStyle = C.muted; ctx.font = '500 ' + small + 'px system-ui';
+      ctx.fillText(R.weapons[held[1]], x + r + 5 * u, y - r + small + 2);
+    }
     ctx.globalAlpha = 1;
   }
 }
-const PLAYER_SCALE = 0.22;  // screen pixels per map unit at which players are drawn at their base size
 const shortName = n => n.includes('|') ? n.split('|').pop().trim() : n;
+
+// 0..1: how blinded a player is right now (from the flashes in the clip)
+function blindness(pid) {
+  let k = 0;
+  for (const [t0, t1] of R.blinds.get(pid) || []) {
+    if (cur >= t0 && cur <= t1) k = Math.max(k, Math.min(1, (t1 - cur) / TR));
+  }
+  return k;
+}
+
+// a fading line through where each player was over the last TRAIL seconds
+function drawTrails(pos, onShown) {
+  const fa = frameAt(cur);
+  if (!fa) return;
+  const from = cur - TRAIL * TR;
+  let i0 = fa[0];
+  while (i0 > 0 && R.frames[i0 - 1].t >= from) i0--;
+  ctx.lineCap = 'round'; ctx.lineWidth = 2 * u;
+  for (const [pid, p] of pos) {
+    const pl = R.players[pid];
+    const pts = [];
+    for (let i = i0; i <= fa[0]; i++) { const e = R.frames[i].m.get(pid); if (e) pts.push([R.frames[i].t, e[1], e[2], e[5]]); }
+    pts.push([cur, p.x, p.y, p.z]);
+    const base = (pl.local || pid === R.anchor_id ? 0.6 : 0.25) * (onShown(p) ? 1 : 0.35);
+    ctx.strokeStyle = pl.team === 'CT' ? C.ct : C.t;
+    for (let i = 1; i < pts.length; i++) {
+      const [ta, xa, ya, za] = pts[i - 1], [, xb, yb, zb] = pts[i];
+      if (split && isLower(za) !== isLower(zb)) continue;  // changed level: don't draw across the gap
+      ctx.globalAlpha = base * Math.max(0, (ta - from) / (TRAIL * TR));
+      ctx.beginPath(); ctx.moveTo(sx(wx(xa, za)), sy(ya)); ctx.lineTo(sx(wx(xb, zb)), sy(yb)); ctx.stroke();
+    }
+  }
+  ctx.lineCap = 'butt'; ctx.globalAlpha = 1;
+}
 
 // grenades: a trail while in the air, then the effect where it landed
 function drawUtility() {
-  for (const u of R.utility) {
-    const look = UTIL[u.kind];
-    if (!look || cur < u.t0 || cur > u.te + (look.burst || 0) * TR) continue;
-    const col = C[look.col];
-    if (cur < u.td) {
+  for (const g of R.utility) {
+    const look = UTIL[g.kind];
+    if (!look || cur < g.t0 || cur > g.te + (look.burst || 0) * TR) continue;
+    const col = C[look.col], gx = x => sx(wx(x, g.z));
+    if (cur < g.td) {
       // in flight: path so far, in the thrower's team colour, and the grenade itself
-      const pts = u.path.filter(p => p[0] <= cur);
-      const nx = u.path.find(p => p[0] > cur);
+      const pts = g.path.filter(p => p[0] <= cur);
+      const nx = g.path.find(p => p[0] > cur);
       let head = pts[pts.length - 1];
       if (head && nx) { const k = (cur - head[0]) / (nx[0] - head[0]); head = [cur, head[1] + (nx[1] - head[1]) * k, head[2] + (nx[2] - head[2]) * k]; }
       if (!head) continue;
-      ctx.globalAlpha = .7; ctx.strokeStyle = u.team === 'CT' ? C.ct : C.t; ctx.lineWidth = 1.5;
-      ctx.beginPath(); ctx.moveTo(sx(pts[0][1]), sy(pts[0][2]));
-      for (const p of pts.slice(1)) ctx.lineTo(sx(p[1]), sy(p[2]));
-      ctx.lineTo(sx(head[1]), sy(head[2])); ctx.stroke();
-      ctx.globalAlpha = 1; ctx.fillStyle = col; ctx.strokeStyle = C.bg; ctx.lineWidth = 1;
-      ctx.beginPath(); ctx.arc(sx(head[1]), sy(head[2]), 3.5, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+      ctx.globalAlpha = .7; ctx.strokeStyle = g.team === 'CT' ? C.ct : C.t; ctx.lineWidth = 1.5 * u;
+      ctx.beginPath(); ctx.moveTo(gx(pts[0][1]), sy(pts[0][2]));
+      for (const p of pts.slice(1)) ctx.lineTo(gx(p[1]), sy(p[2]));
+      ctx.lineTo(gx(head[1]), sy(head[2])); ctx.stroke();
+      ctx.globalAlpha = 1; ctx.fillStyle = col; ctx.strokeStyle = C.bg; ctx.lineWidth = u;
+      ctx.beginPath(); ctx.arc(gx(head[1]), sy(head[2]), 3.5 * u, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
       continue;
     }
-    const x = sx(u.x), y = sy(u.y), r = look.r * view.s, age = (cur - u.td) / TR;
+    const x = gx(g.x), y = sy(g.y), r = look.r * view.s, age = (cur - g.td) / TR;
     if (look.burst) {
       // flash / HE: a quick expanding burst
       const k = Math.min(1, age / look.burst);
       ctx.globalAlpha = (1 - k) * .8;
-      ctx.strokeStyle = col; ctx.lineWidth = 3;
+      ctx.strokeStyle = col; ctx.lineWidth = 3 * u;
       ctx.beginPath(); ctx.arc(x, y, Math.max(4, r * (0.3 + 0.7 * k)), 0, Math.PI * 2); ctx.stroke();
-      if (u.kind === 'flash') { ctx.fillStyle = col; ctx.globalAlpha = (1 - k) * .35; ctx.fill(); }
+      if (g.kind === 'flash') { ctx.fillStyle = col; ctx.globalAlpha = (1 - k) * .35; ctx.fill(); }
     } else {
       // smoke / fire / decoy: an area that fades in and out
-      const left = (u.te - cur) / TR;
-      ctx.globalAlpha = Math.max(0, Math.min(1, age / 0.5, left / 1)) * (u.kind === 'smoke' ? .6 : .45);
+      const left = (g.te - cur) / TR;
+      ctx.globalAlpha = Math.max(0, Math.min(1, age / 0.5, left / 1)) * (g.kind === 'smoke' ? .6 : .45);
       ctx.fillStyle = col;
       ctx.beginPath(); ctx.arc(x, y, Math.max(3, r), 0, Math.PI * 2); ctx.fill();
-      ctx.globalAlpha *= 1.4; ctx.strokeStyle = col; ctx.lineWidth = 1.5; ctx.stroke();
+      ctx.globalAlpha *= 1.4; ctx.strokeStyle = col; ctx.lineWidth = 1.5 * u; ctx.stroke();
     }
     ctx.globalAlpha = 1;
   }
 }
-function drawX(wx, wy, col, big) {
-  const x = sx(wx), y = sy(wy), s = big ? 7 : 5;
-  ctx.strokeStyle = col; ctx.lineWidth = big ? 3 : 2; ctx.globalAlpha = .85;
+// positions here are [x, y, z] in world units
+function drawX(at, col, big) {
+  const x = sx(wx(at[0], at[2])), y = sy(at[1]), s = (big ? 7 : 5) * u;
+  ctx.strokeStyle = col; ctx.lineWidth = (big ? 3 : 2) * u; ctx.globalAlpha = .85;
   ctx.beginPath(); ctx.moveTo(x - s, y - s); ctx.lineTo(x + s, y + s); ctx.moveTo(x + s, y - s); ctx.lineTo(x - s, y + s); ctx.stroke();
   ctx.globalAlpha = 1;
 }
 function line(a, b, col, w, alpha) {
-  ctx.globalAlpha = Math.max(0, alpha); ctx.strokeStyle = col; ctx.lineWidth = w;
-  ctx.beginPath(); ctx.moveTo(sx(a[0]), sy(a[1])); ctx.lineTo(sx(b[0]), sy(b[1])); ctx.stroke();
+  ctx.globalAlpha = Math.max(0, alpha); ctx.strokeStyle = col; ctx.lineWidth = w * u;
+  ctx.beginPath(); ctx.moveTo(sx(wx(a[0], a[2])), sy(a[1])); ctx.lineTo(sx(wx(b[0], b[2])), sy(b[1])); ctx.stroke();
+  ctx.globalAlpha = 1;
+}
+function drawC4(at, alpha) {
+  const x = sx(wx(at[0], at[2])), y = sy(at[1]), s = 6 * u;
+  ctx.globalAlpha = alpha;
+  ctx.fillStyle = C.bad; ctx.fillRect(x - s, y - s, 2 * s, 2 * s);
+  ctx.fillStyle = C.bg; ctx.font = `700 ${Math.max(7, 10 * u)}px system-ui`; ctx.textAlign = 'center';
+  ctx.fillText('C4', x, y + 3.5 * u);
   ctx.globalAlpha = 1;
 }
 
@@ -579,9 +692,24 @@ function renderMarks() {
 function seek(t) {
   cur = Math.max(R.start, Math.min(R.end, t));
   $('scrub').value = cur;
-  const clock = `Round ${R.round} · contact ${rel(cur)}`;
-  if ($('clock').textContent !== clock) $('clock').textContent = clock;
+  const clock = clockText();
+  if (clock !== lastClock) { $('clock').innerHTML = clock; lastClock = clock; }
   updateFeed(); draw();
+}
+// round time left, or the bomb's fuse once it's down
+let lastClock = '';
+const mmss = s => `${Math.floor(Math.max(0, s) / 60)}:${String(Math.floor(Math.max(0, s) % 60)).padStart(2, '0')}`;
+function clockText() {
+  let time = '';
+  if (R.round_start != null) {
+    const sec = t => (t - cur) / TR;
+    const end = R.bomb_end;
+    if (end && cur >= end[0]) time = `<b class="bomb">Bomb ${end[1]}</b>`;
+    else if (R.plant_tick != null && cur >= R.plant_tick) time = `<b class="bomb">Bomb ${mmss(sec(R.plant_tick + BOMB_TIME * TR))}</b>`;
+    else time = mmss(sec(R.round_start + ROUND_TIME * TR));
+    time += ' · ';
+  }
+  return `Round ${R.round} · ${time}contact ${rel(cur)}`;
 }
 function select(id) {
   R = D.reviews.find(r => r.id === id);
@@ -625,9 +753,13 @@ $('util').onclick = () => {
   if (R) updateFeed(true);
   draw();
 };
-$('level').onclick = () => {
-  level = { auto: 'upper', upper: 'lower', lower: 'auto' }[level];
+function setLevel(l) {
+  level = l; split = level === 'both' && below != null;
   $('level').textContent = 'Level: ' + level; draw();
+}
+$('level').onclick = () => {
+  setLevel({ both: 'auto', auto: 'upper', upper: 'lower', lower: 'both' }[level]);
+  focusFight();  // the layout changes between side by side and one level
 };
 $('scrub').oninput = e => { setPlaying(false); seek(+e.target.value); };
 document.addEventListener('keydown', e => {

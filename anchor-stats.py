@@ -42,6 +42,7 @@ How it works
 import argparse
 import base64
 import functools
+import gzip
 import json
 import math
 import os
@@ -56,12 +57,14 @@ from collections import Counter, defaultdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
+import numpy as np
 import pandas as pd
 from demoparser2 import DemoParser
 
 # ---------------------------------------------------------------- tunables --
 TICKRATE = 64
-SAMPLE_EVERY = 16             # sample positions every 16 ticks (0.25 s)
+SAMPLE_EVERY = 16             # the analysis samples positions every 16 ticks (0.25 s)
+CLIP_SAMPLE_EVERY = 8         # viewer clips sample every 8 ticks (0.125 s) for smoother movement
 SETUP_START = 8               # seconds after freeze end to start judging setups
 SETUP_END = 20                # seconds after freeze end to stop judging setups
 SETUP_MIN_SHARE = 0.6         # share of setup samples that must be on the site
@@ -118,14 +121,18 @@ EVENTS = {
     "player_death": ["tick", "user_steamid", "attacker_steamid", "assister_steamid", "weapon", "headshot"],
     "player_hurt": ["tick", "user_steamid", "attacker_steamid", "dmg_health"],
     "bomb_planted": ["tick", "user_steamid"],
-    # utility, for the viewer
-    "smokegrenade_detonate": ["tick", "entityid", "x", "y"],
+    # the bomb and utility, for the viewer
+    "bomb_pickup": ["tick", "user_steamid"],
+    "bomb_dropped": ["tick", "user_steamid"],
+    "bomb_defused": ["tick"],
+    "bomb_exploded": ["tick"],
+    "smokegrenade_detonate": ["tick", "entityid", "x", "y", "z"],
     "smokegrenade_expired": ["tick", "entityid"],
-    "inferno_startburn": ["tick", "entityid", "x", "y"],
+    "inferno_startburn": ["tick", "entityid", "x", "y", "z"],
     "inferno_expire": ["tick", "entityid"],
-    "flashbang_detonate": ["tick", "entityid", "x", "y"],
-    "hegrenade_detonate": ["tick", "entityid", "x", "y"],
-    "decoy_started": ["tick", "entityid", "x", "y"],
+    "flashbang_detonate": ["tick", "entityid", "x", "y", "z"],
+    "hegrenade_detonate": ["tick", "entityid", "x", "y", "z"],
+    "decoy_started": ["tick", "entityid", "x", "y", "z"],
     "decoy_detonate": ["tick", "entityid"],
     "player_blind": ["tick", "entityid", "user_steamid", "attacker_steamid", "blind_duration"],
 }
@@ -205,51 +212,92 @@ def parse_events(parser):
     return events
 
 
+def by_entity(df, cols):
+    """{entity id: rows of cols sorted by tick} for one event."""
+    out = defaultdict(list)
+    for row in df.sort_values("tick")[["entityid", *cols]].itertuples(index=False):
+        if not pd.isna(row[0]):
+            out[int(row[0])].append(row[1:])
+    return out
+
+
 def grenade_throws(parser, events):
     """Every thrown grenade: flight path, where and when it went off, when its effect ended, who it blinded."""
     try:
         g = parser.parse_grenades()
     except Exception:  # utility is a viewer extra; never fail a demo over it
         return []
-    g = g[g["grenade_type"].isin(list(GRENADES)) & g["x"].notna()].sort_values(["grenade_entity_id", "tick"])
+    g = g[g["grenade_type"].isin(list(GRENADES)) & g["x"].notna()]
+    if g.empty:
+        return []
+    g = g.sort_values(["grenade_entity_id", "tick"], kind="stable")
+    ent, tick = g["grenade_entity_id"].to_numpy(), g["tick"].to_numpy()
+    xyz = np.nan_to_num(g[["x", "y", "z"]].to_numpy(dtype=float)).round().astype(int)
+    kinds, owners = g["grenade_type"].to_numpy(), g["steamid"].to_numpy()
     # entity ids get reused during a match, so a gap in ticks starts a new throw
-    new_throw = (g["grenade_entity_id"] != g["grenade_entity_id"].shift()) | (g["tick"].diff() > 32)
-    throws = []
-    for _, t in g.groupby(new_throw.cumsum()):
-        kind, went_off, ended, lasts = GRENADES[t["grenade_type"].iloc[0]]
-        entity = int(t["grenade_entity_id"].iloc[0])
-        start, last = int(t["tick"].iloc[0]), int(t["tick"].iloc[-1])
-        det, x, y, effect = last, t["x"].iloc[-1], t["y"].iloc[-1], entity
-        if went_off:
-            e = events[went_off]
-            e = e[(e["entityid"] == entity) & (e["tick"] >= start) & (e["tick"] <= last + 64)]
-            if len(e):
-                det, x, y = int(e["tick"].iloc[0]), e["x"].iloc[0], e["y"].iloc[0]
-        else:
-            e = events["inferno_startburn"]
-            e = e[(e["tick"] >= last - 16) & (e["tick"] <= last + 64)]
-            gap = (e["x"] - x) ** 2 + (e["y"] - y) ** 2
-            if len(e) and gap.min() <= 300 ** 2:
-                i = gap.idxmin()
-                det, x, y, effect = int(e.at[i, "tick"]), e.at[i, "x"], e.at[i, "y"], int(e.at[i, "entityid"])
-        end = det
-        if ended:
-            e = events[ended]
-            e = e[(e["entityid"] == effect) & (e["tick"] > det)]
-            end = int(e["tick"].iloc[0]) if len(e) else det + lasts * TICKRATE
+    starts = np.flatnonzero(np.r_[True, (ent[1:] != ent[:-1]) | (np.diff(tick) > 32)])
 
-        flight = t[t["tick"] <= det]
-        path = [[int(r.tick), num(r.x), num(r.y)] for r in flight.iloc[::GRENADE_PATH_EVERY].itertuples()]
-        if len(flight) and path[-1][0] != int(flight["tick"].iloc[-1]):
-            path.append([int(flight["tick"].iloc[-1]), num(flight["x"].iloc[-1]), num(flight["y"].iloc[-1])])
+    went_off = {name: by_entity(events[name], ["tick", "x", "y", "z"])
+                for name in {v[1] for v in GRENADES.values() if v[1]}}
+    ended = {name: by_entity(events[name], ["tick"]) for name in {v[2] for v in GRENADES.values() if v[2]}}
+    blinds = by_entity(events["player_blind"], ["tick", "user_steamid", "blind_duration"])
+    fires = events["inferno_startburn"].sort_values("tick")
+    fire_tick, fire_xyz, fire_id = (fires["tick"].to_numpy(), fires[["x", "y", "z"]].to_numpy(dtype=float),
+                                    fires["entityid"].to_numpy())
+
+    throws = []
+    for a, b in zip(starts, np.r_[starts[1:], len(g)]):
+        kind, off_event, end_event, lasts = GRENADES[kinds[a]]
+        entity, first, last = int(ent[a]), int(tick[a]), int(tick[b - 1])
+        det, (x, y, z), effect = last, xyz[b - 1], entity
+        if off_event:
+            hit = next((e for e in went_off[off_event].get(entity, ()) if first <= e[0] <= last + 64), None)
+            if hit:
+                det, x, y, z = int(hit[0]), num(hit[1]), num(hit[2]), num(hit[3])
+        else:  # a molotov's fire: the nearest one that starts burning as the projectile lands
+            i, j = np.searchsorted(fire_tick, [last - 16, last + 65])
+            if j > i:
+                gap = ((fire_xyz[i:j, :2] - (x, y)) ** 2).sum(axis=1)
+                k = int(np.nanargmin(gap)) if not np.isnan(gap).all() else None
+                if k is not None and gap[k] <= 300 ** 2:
+                    det, effect = int(fire_tick[i + k]), int(fire_id[i + k])
+                    x, y, z = (num(v) for v in fire_xyz[i + k])
+        end = det
+        if end_event:
+            later = [e[0] for e in ended[end_event].get(effect, ()) if e[0] > det]
+            end = int(later[0]) if later else det + lasts * TICKRATE
+
+        n = int(np.searchsorted(tick[a:b], det, side="right"))  # flight samples up to the detonation
+        keep = list(range(0, n, GRENADE_PATH_EVERY))
+        if n and keep[-1] != n - 1:
+            keep.append(n - 1)
+        path = [[int(tick[a + i]), int(xyz[a + i, 0]), int(xyz[a + i, 1])] for i in keep]
         blinded = []
         if kind == "flash":
-            b = events["player_blind"]
-            b = b[(b["entityid"] == entity) & ((b["tick"] - det).abs() <= 16)]
-            blinded = [(r.user_steamid, round(float(r.blind_duration), 1)) for r in b.itertuples()]
-        throws.append({"kind": kind, "by": sid(t["steamid"].iloc[0]), "t0": start, "td": det, "te": end,
-                       "x": num(x), "y": num(y), "path": path or [[det, num(x), num(y)]], "blinded": blinded})
+            blinded = [(who, round(float(dur), 1)) for t, who, dur in blinds.get(entity, ()) if abs(t - det) <= 16]
+        throws.append({"kind": kind, "by": sid(owners[a]), "t0": first, "td": det, "te": end,
+                       "x": int(x), "y": int(y), "z": int(z), "path": path or [[det, int(x), int(y)]],
+                       "blinded": blinded})
     return throws
+
+
+def weapon_label(name):
+    """Short label for a held weapon; knife skins all read as "Knife"."""
+    if not isinstance(name, str) or not name:
+        return ""
+    low = name.lower()
+    if any(k in low for k in ("knife", "dagger", "bayonet", "karambit")):
+        return "Knife"
+    return {"C4 Explosive": "C4", "High Explosive Grenade": "HE Grenade", "Incendiary Grenade": "Incendiary"}.get(
+        name, name)
+
+
+def bomb_log(events):
+    """Every change of who has the bomb: (tick, carrier steamid or None, dropper steamid or None), by tick."""
+    log = [(int(r.tick), r.user_steamid, None) for r in events["bomb_pickup"].itertuples()]
+    log += [(int(r.tick), None, r.user_steamid) for r in events["bomb_dropped"].itertuples()]
+    log += [(int(r.tick), None, None) for r in events["bomb_planted"].itertuples()]
+    return sorted(log, key=lambda e: e[0])
 
 
 def get_rounds(events):
@@ -277,6 +325,33 @@ def get_rounds(events):
     return rounds
 
 
+def clip_frames(clip, pidx, levels):
+    """A clip's position frames, plus each player's held weapon as changes only.
+
+    frames: [{"t": tick, "p": [[player, x, y, yaw, hp(, z)], ...]}, ...]
+    held:   {player: [[tick, weapon index], ...]}, weapons: [weapon label, ...]
+    """
+    if clip.empty:
+        return [], {}, []
+    cols = ["X", "Y", "yaw", "health"] + (["Z"] if levels else [])
+    vals = np.nan_to_num(clip[cols].to_numpy(dtype=float)).round().astype(int)
+    pid = clip["steamid"].map(pidx).to_numpy()
+    rows = np.column_stack([pid, vals])
+    tick = clip["tick"].to_numpy()
+    cut = np.flatnonzero(np.diff(tick)) + 1
+    frames = [{"t": int(t), "p": chunk.tolist()} for t, chunk in zip(tick[np.r_[0, cut]], np.split(rows, cut))]
+
+    labels = clip["active_weapon_name"].map(weapon_label).to_numpy()
+    weapons = sorted(set(labels) - {""})
+    windex = {w: i for i, w in enumerate(weapons)}
+    held = {}
+    for p in set(pid.tolist()):
+        mine = np.flatnonzero(pid == p)
+        changes = [i for k, i in enumerate(mine) if k == 0 or labels[i] != labels[mine[k - 1]]]
+        held[int(p)] = [[int(tick[i]), windex.get(labels[i])] for i in changes]
+    return frames, held, weapons
+
+
 # -------------------------------------------------------------------- core --
 def analyse(path, site_places):
     parser = DemoParser(path)
@@ -289,23 +364,36 @@ def analyse(path, site_places):
     deaths, hurts, plants = events["player_death"], events["player_hurt"], events["bomb_planted"]
     rounds = get_rounds(events)
     throws = grenade_throws(parser, events)
+    bombs = bomb_log(events)
+    bomb_ends = sorted([(int(t), "defused") for t in events["bomb_defused"]["tick"]]
+                       + [(int(t), "exploded") for t in events["bomb_exploded"]["tick"]])
+    levels = bool((radar(map_name) or {}).get("lower"))  # clips only need height on two-level maps
 
-    sample_ticks = sorted({t for _, ft, et, _ in rounds for t in range(ft, et + 1, SAMPLE_EVERY)})
-    ticks = parser.parse_ticks(
-        ["X", "Y", "Z", "yaw", "health", "last_place_name", "team_num", "is_alive", "current_equip_value"],
+    # the viewer's clips want CLIP_SAMPLE_EVERY; reading the extra ticks costs next to nothing
+    sample_ticks = sorted({t for _, ft, et, _ in rounds for t in range(ft, et + 1, CLIP_SAMPLE_EVERY)})
+    all_ticks = parser.parse_ticks(
+        ["X", "Y", "Z", "yaw", "health", "last_place_name", "team_num", "is_alive", "current_equip_value",
+         "active_weapon_name"],
         ticks=sample_ticks,
     )
-    ticks = ticks[ticks["is_alive"] == True].sort_values("tick")  # noqa: E712
-    ticks["steamid"] = ticks["steamid"].map(sid)
+    all_ticks = all_ticks[all_ticks["is_alive"] == True].sort_values("tick", kind="stable")  # noqa: E712
+    all_ticks["steamid"] = all_ticks["steamid"].map(sid)
+    # the analysis itself runs on every SAMPLE_EVERY-th tick of each round
+    round_of = np.searchsorted([ft for _, ft, _, _ in rounds], all_ticks["tick"].to_numpy(), side="right") - 1
+    round_start = np.array([ft for _, ft, _, _ in rounds])[np.maximum(round_of, 0)]
+    ticks = all_ticks[(all_ticks["tick"].to_numpy() - round_start) % SAMPLE_EVERY == 0].copy()
     sites = {p: site_of(p, site_places) for p in ticks["last_place_name"].unique()}
     ticks["site"] = ticks["last_place_name"].map(sites)
     names = dict(zip(ticks["steamid"], ticks["name"]))
 
     engagements, reviews = [], []
+    prev_end = 0
     for rnd, ft, et, winner in rounds:
         rticks = ticks[(ticks["tick"] >= ft) & (ticks["tick"] <= et)]
+        round_prev_end, prev_end = prev_end, et
         if rticks.empty:
             continue
+        r_all = all_ticks[(all_ticks["tick"] >= ft) & (all_ticks["tick"] <= et)]
         team_of = dict(zip(rticks["steamid"], rticks["team_num"]))
         # what each player bought (equipment value once the buy is done)
         buy = rticks[rticks["tick"] <= ft + SETUP_END * TICKRATE].groupby("steamid")["current_equip_value"].max()
@@ -516,12 +604,15 @@ def analyse(path, site_places):
             # ---- 7. playback clip for the viewer
             view_lo = max(ft, contact_tick - PRE_ROLL * TICKRATE)
             view_hi = min(et, (death_tick or et) + POST_ROLL * TICKRATE, contact_tick + MAX_CLIP * TICKRATE)
-            clip = rticks[(rticks["tick"] >= view_lo) & (rticks["tick"] <= view_hi)]
+            clip = r_all[(r_all["tick"] >= view_lo) & (r_all["tick"] <= view_hi)]
             pids = list(dict.fromkeys(clip["steamid"]))
             pidx = {p: i for i, p in enumerate(pids)}
-            frames = [{"t": int(t), "p": [[pidx[r.steamid], num(r.X), num(r.Y), num(r.yaw), num(r.health), num(r.Z)]
-                                           for r in g.itertuples()]}
-                      for t, g in clip.groupby("tick")]
+            frames, holding, weapons = clip_frames(clip, pidx, levels)
+            # who has the bomb: the state when the clip starts, then every change during it
+            before = [e for e in bombs if round_prev_end < e[0] <= view_lo]
+            bomb = [[view_lo, pidx.get(before[-1][1]), None]] if before and before[-1][1] else []
+            bomb += [[t, pidx.get(c), pidx.get(d)] for t, c, d in bombs if view_lo < t <= view_hi]
+            bomb_end = next(((t, k) for t, k in bomb_ends if ft <= t <= et), None)
             in_view = lambda df: df[(df["tick"] >= view_lo) & (df["tick"] <= view_hi)].itertuples()
             clip_events = [{"t": contact_tick, "type": "contact"}]
             for d in in_view(r_deaths):
@@ -557,6 +648,9 @@ def analyse(path, site_places):
                 "players": [{"name": names.get(p, p), "team": "CT" if team_of.get(p) == CT_TEAM else "T",
                              "local": p in enemies or p in mates} for p in pids],
                 "frames": frames, "events": clip_events, "utility": utility, "notes": notes,
+                "weapons": weapons, "held": holding, "bomb": bomb,
+                "round_start": ft, "plant_tick": plant_tick,
+                "bomb_end": list(bomb_end) if bomb_end else None,
                 "breakdown": [{"label": l, "value": round(v, 2), "detail": d} for l, v, d in parts],
             })
 
@@ -592,10 +686,14 @@ def analyse(path, site_places):
 
 
 # ------------------------------------------------------------------- maps --
+RADAR_TYPES = {".webp": "image/webp", ".png": "image/png"}
+
+
 def radar_files(map_name):
-    """(overview .txt, radar .png) for this map from maps/, or None."""
-    txt, png = (os.path.join(MAPS_DIR, os.path.basename(map_name) + ext) for ext in (".txt", ".png"))
-    return (txt, png) if os.path.isfile(txt) and os.path.isfile(png) else None
+    """(overview .txt, radar image) for this map from maps/, or None. WebP is preferred; it's much smaller."""
+    base = os.path.join(MAPS_DIR, os.path.basename(map_name))
+    image = next((base + ext for ext in RADAR_TYPES if os.path.isfile(base + ext)), None)
+    return (base + ".txt", image) if image and os.path.isfile(base + ".txt") else None
 
 
 @functools.lru_cache(maxsize=None)
@@ -612,10 +710,11 @@ def radar(map_name, embed=False):
         if not embed:
             return "/maps/" + os.path.basename(path)
         with open(path, "rb") as f:
-            return "data:image/png;base64," + base64.b64encode(f.read()).decode()
+            return f"data:{RADAR_TYPES[os.path.splitext(path)[1]]};base64," + base64.b64encode(f.read()).decode()
 
     info = {"pos_x": value("pos_x"), "pos_y": value("pos_y"), "scale": value("scale"), "image": image(files[1])}
-    lower = files[1][:-len(".png")] + "_lower.png"
+    stem, ext = os.path.splitext(files[1])
+    lower = stem + "_lower" + ext
     split = re.search(r'"lower".*?"AltitudeMax"\s+"([-\d.]+)"', overview, re.S)
     if os.path.isfile(lower) and split:  # two-level maps like Nuke
         info["lower"] = {"image": image(lower), "below": float(split.group(1))}
@@ -624,10 +723,10 @@ def radar(map_name, embed=False):
 
 def map_background(ticks, outline=True, cell=48):
     """Map bounds and nav place labels, plus an outline traced from where players stood (for maps without a radar)."""
-    labels = ticks.groupby("last_place_name")[["X", "Y"]].median()
+    labels = ticks.groupby("last_place_name")[["X", "Y", "Z"]].median()
     background = {
         "bounds": [num(ticks["X"].min()), num(ticks["Y"].min()), num(ticks["X"].max()), num(ticks["Y"].max())],
-        "labels": [{"name": n, "x": num(r.X), "y": num(r.Y)} for n, r in labels.iterrows() if n],
+        "labels": [{"name": n, "x": num(r.X), "y": num(r.Y), "z": num(r.Z)} for n, r in labels.iterrows() if n],
     }
     if outline:
         cells = set(zip((ticks["X"] // cell).astype(int), (ticks["Y"] // cell).astype(int)))
@@ -730,6 +829,9 @@ def write_results(map_name, eng, data, out=None, viewer_path=None, csv=None, dat
     return data
 
 
+DELETE_DEMOS = False  # --delete-demos: remove each .dem once its results are saved
+
+
 def process_demo(path, site_places, player=None):
     """Analyse one demo into output/<demo name>/ and return that name."""
     stem = os.path.splitext(os.path.basename(path))[0]
@@ -743,6 +845,9 @@ def process_demo(path, site_places, player=None):
                       excluded=read_excluded(out_dir))
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump({"name": stem, "map": map_name, "engagements": n, "processed": time.time()}, f)
+    if DELETE_DEMOS:
+        os.remove(path)
+        print(f"Deleted {os.path.basename(path)} (its results are saved; it can't be reprocessed now)")
     return stem
 
 
@@ -862,10 +967,17 @@ class App(BaseHTTPRequestHandler):
             body = to_json(body)
         if isinstance(body, str):
             body = body.encode("utf-8")
+        squeeze = (len(body) > 4096 and not ctype.startswith("image/")
+                   and "gzip" in self.headers.get("Accept-Encoding", ""))
+        if squeeze:  # viewer data compresses to about a fifth
+            body = gzip.compress(body, 6)
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
+        if squeeze:
+            self.send_header("Content-Encoding", "gzip")
+        if not any(h[0] == "Cache-Control" for h in headers):
+            self.send_header("Cache-Control", "no-store")
         for header in headers:
             self.send_header(*header)
         self.end_headers()
@@ -881,9 +993,10 @@ class App(BaseHTTPRequestHandler):
             return self.reply(200, list(JOBS.values()))
         if path.startswith("/maps/"):
             file = os.path.join(MAPS_DIR, os.path.basename(path))
-            if file.endswith(".png") and os.path.isfile(file):
+            ctype = RADAR_TYPES.get(os.path.splitext(file)[1])
+            if ctype and os.path.isfile(file):
                 with open(file, "rb") as f:
-                    return self.reply(200, f.read(), "image/png")
+                    return self.reply(200, f.read(), ctype, [("Cache-Control", "max-age=86400")])
         if path.startswith("/api/demos/"):
             name, _, action = path[len("/api/demos/"):].partition("/")
             data = load_demo(name)
@@ -971,9 +1084,13 @@ def main():
     ap.add_argument("--csv", help="write every engagement to this CSV file")
     ap.add_argument("--out", help="also write the printed report to this text file")
     ap.add_argument("--viewer", help="write a standalone 2D replay viewer of every engagement to this .html file")
+    ap.add_argument("--delete-demos", action="store_true",
+                    help="delete each .dem after processing to save space (it can't be reprocessed afterwards)")
     ap.add_argument("--extra-places", action="append", default=[],
                     help='treat extra nav place names as a site, e.g. "BombsiteB:Bench,Market"')
     args = ap.parse_args()
+    global DELETE_DEMOS
+    DELETE_DEMOS = args.delete_demos
 
     site_places = {k: set(v) for k, v in SITE_PLACES.items()}
     for spec in args.extra_places:
