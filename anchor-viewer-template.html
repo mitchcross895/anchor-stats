@@ -36,6 +36,7 @@
   .tabs button { flex: 1; background: none; border: 0; border-radius: 5px; padding: 5px 8px; color: var(--muted);
                  cursor: pointer; font-size: 12.5px; font-weight: 600; }
   .tabs button.on { background: var(--bg); color: var(--text); }
+  .list li.hint { display: block; cursor: default; }
   .list .sc.ct { color: var(--ct); } .list .sc.t { color: var(--t); }
   .anchors { list-style: none; margin: 0; padding: 0; }
   .anchors li { padding: 5px 6px; border-radius: 4px; cursor: pointer; display: flex; justify-content: space-between; gap: 8px; }
@@ -107,6 +108,9 @@
   .btn { background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 5px 10px; cursor: pointer; }
   .btn:hover { border-color: var(--accent); }
   .btn:disabled { opacity: .5; cursor: not-allowed; }
+  .export { display: flex; flex-direction: column; gap: 4px; }
+  .export[hidden] { display: none; }
+  .export label, .setting { color: var(--muted); font-size: 12px; display: flex; align-items: center; gap: 6px; cursor: pointer; }
   a.btn { color: inherit; text-decoration: none; text-align: center; font-size: 12.5px; }
   .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--bg); font-weight: 600; }
   .jobs { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; font-size: 12.5px; }
@@ -144,7 +148,13 @@
         <select id="demoPick" title="Processed demos"></select>
         <button class="btn primary" id="uploadBtn">Upload</button>
       </div>
-      <a class="btn" id="exportBtn" hidden title="Download a standalone copy of this demo's review that works offline">Download offline copy</a>
+      <div class="export" id="exportRow" hidden>
+        <a class="btn" id="exportBtn" title="Download a standalone copy of this demo's review that works offline">Download offline copy</a>
+        <label title="Adds every round, so the copy can play the whole match (makes it about 4 MB instead of 1 MB)">
+          <input type="checkbox" id="exportMatch"> include full match</label>
+      </div>
+      <label class="setting" title="Saves space, but a deleted demo can't be reprocessed unless it's uploaded again">
+        <input type="checkbox" id="deleteDemos"> Delete each .dem after processing</label>
       <input type="file" id="file" accept=".dem" multiple hidden>
       <ul class="jobs" id="jobs"></ul>
     </div>
@@ -383,7 +393,7 @@ let dirty = true;
 const draw = () => { dirty = true; };
 let u = 1;  // marker scale: 1 at the "Focus fight" zoom, so markers keep their size relative to the map
 const PLAYER_SCALE = 0.22;  // screen pixels per map unit at which markers are drawn at their base size
-const ROUND_TIME = 115, BOMB_TIME = 40;  // seconds: round timer after freeze time, bomb fuse
+const ROUND_TIME = 115, BOMB_TIME = 40;  // seconds: fallbacks for demos processed before these were measured
 
 // the map layer only changes when the view does, so it's rendered once and copied each frame
 const bgCv = document.createElement('canvas'), bgCtx = bgCv.getContext('2d');
@@ -637,9 +647,8 @@ async function showRounds() {
         if (!r.ok) throw new Error(r.statusText);
         rounds = await r.json();
       }
-      if (!rounds) throw new Error('This copy has no full-match playback. Download the offline copy again from the app.');
-      rounds.forEach(prepare);
-      MATCH = rounds;
+      if (!rounds) throw new Error('This copy has no full-match playback. Download it again from the app with "include full match" ticked.');
+      MATCH = rounds;  // each round is prepared when it's first played
     } catch (e) {
       $('list').innerHTML = `<li class="hint">${esc(e.message === 'Failed to fetch' ? OFFLINE : e.message)}</li>`;
       return;
@@ -662,6 +671,7 @@ function renderRounds() {
 // keepView: carry on with the same zoom when playback runs on into the next round
 function selectRound(i, keepView) {
   R = MATCH[i];
+  if (!R.feed) prepare(R);
   $('scrub').min = R.start; $('scrub').max = R.end;
   renderRounds(); renderRoundNotes(); renderMarks();
   if (!keepView) fitMap();
@@ -777,8 +787,8 @@ function clockText() {
     const sec = t => (t - cur) / TR;
     const end = R.bomb_end;
     if (end && cur >= end[0]) time = `<b class="bomb">Bomb ${end[1]}</b>`;
-    else if (R.plant_tick != null && cur >= R.plant_tick) time = `<b class="bomb">Bomb ${mmss(sec(R.plant_tick + BOMB_TIME * TR))}</b>`;
-    else time = mmss(sec(R.round_start + ROUND_TIME * TR));
+    else if (R.plant_tick != null && cur >= R.plant_tick) time = `<b class="bomb">Bomb ${mmss(sec(R.plant_tick + (D.bomb_time || BOMB_TIME) * TR))}</b>`;
+    else time = mmss(sec(R.round_start + (R.round_time || ROUND_TIME) * TR));
     time += ' · ';
   }
   return R.contact_tick == null ? `Round ${R.round} · ${time.slice(0, -3)}` : `Round ${R.round} · ${time}contact ${rel(cur)}`;
@@ -896,14 +906,35 @@ async function refreshDemos(open) {
   else if (D) $('demoPick').value = D.name || '';
   if (!demos.length && !D) $('empty').hidden = false;
 }
+function setExportLink() {
+  if (D && D.name) $('exportBtn').href = `/api/demos/${encodeURIComponent(D.name)}/export${$('exportMatch').checked ? '?match=1' : ''}`;
+}
+$('exportMatch').onchange = setExportLink;
+
+// ---------- app setting: delete demos once processed
+async function loadSettings() {
+  try { $('deleteDemos').checked = (await getJSON('/api/settings')).delete_demos; } catch (e) { /* offline: keep it as is */ }
+}
+$('deleteDemos').onchange = async e => {
+  const want = e.target.checked;
+  try {
+    const r = await fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                             body: JSON.stringify({ delete_demos: want }) });
+    if (!r.ok) throw new Error(r.statusText);
+  } catch (err) {
+    e.target.checked = !want;
+    notices.push(`Couldn't change the setting: ${err.message === 'Failed to fetch' ? OFFLINE : err.message}`); renderJobs();
+  }
+};
+
 async function openDemo(name) {
   try {
     const data = await getJSON('/api/demos/' + encodeURIComponent(name));
     data.name = name;
     load(data);
     $('demoPick').value = name;
-    $('exportBtn').href = `/api/demos/${encodeURIComponent(name)}/export`;
-    $('exportBtn').hidden = false;
+    setExportLink();
+    $('exportRow').hidden = false;
   } catch (e) { notices.push(`Couldn't open ${name}: ${e.message}`); renderJobs(); }
 }
 
@@ -990,6 +1021,7 @@ function startApp() {
   $('emptyUpload').onclick = pick;
   $('file').onchange = e => { [...e.target.files].forEach(upload); e.target.value = ''; };
   $('demoPick').onchange = e => e.target.value && openDemo(e.target.value);
+  loadSettings();
   let depth = 0;  // dragenter/leave fire for every child element
   const hasFiles = e => [...(e.dataTransfer?.types || [])].includes('Files');
   window.addEventListener('dragenter', e => { if (hasFiles(e)) { depth++; document.body.classList.add('dropping'); } });

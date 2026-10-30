@@ -43,6 +43,7 @@ import argparse
 import base64
 import functools
 import gzip
+import io
 import json
 import math
 import os
@@ -65,6 +66,8 @@ from demoparser2 import DemoParser
 TICKRATE = 64
 SAMPLE_EVERY = 16             # the analysis samples positions every 16 ticks (0.25 s)
 CLIP_SAMPLE_EVERY = 8         # viewer clips sample every 8 ticks (0.125 s) for smoother movement
+ROUND_TIME = 115              # viewer clock: seconds per round when the demo doesn't say (it usually does)
+BOMB_TIME = 40                # viewer clock: bomb fuse in seconds when no bomb exploded to measure it
 SETUP_START = 8               # seconds after freeze end to start judging setups
 SETUP_END = 20                # seconds after freeze end to stop judging setups
 SETUP_MIN_SHARE = 0.6         # share of setup samples that must be on the site
@@ -367,15 +370,20 @@ def analyse(path, site_places):
     bombs = bomb_log(events)
     bomb_ends = sorted([(int(t), "defused") for t in events["bomb_defused"]["tick"]]
                        + [(int(t), "exploded") for t in events["bomb_exploded"]["tick"]])
+    # the fuse, as plant -> explosion actually took in this demo (the server setting isn't in the demo)
+    plant_ticks = np.sort(plants["tick"].dropna().to_numpy())
+    fuses = [t - plant_ticks[i - 1] for t, k in bomb_ends if k == "exploded"
+             for i in [np.searchsorted(plant_ticks, t)] if i > 0]
+    bomb_time = round(float(np.median(fuses)) / TICKRATE, 1) if fuses else BOMB_TIME
     levels = bool((radar(map_name) or {}).get("lower"))  # clips only need height on two-level maps
 
     # the viewer's clips want CLIP_SAMPLE_EVERY; reading the extra ticks costs next to nothing
     sample_ticks = sorted({t for _, ft, et, _ in rounds for t in range(ft, et + 1, CLIP_SAMPLE_EVERY)})
     all_ticks = parser.parse_ticks(
         ["X", "Y", "Z", "yaw", "health", "last_place_name", "team_num", "is_alive", "current_equip_value",
-         "active_weapon_name"],
+         "active_weapon_name", "CCSGameRulesProxy.CCSGameRules.m_iRoundTime"],
         ticks=sample_ticks,
-    )
+    ).rename(columns={"CCSGameRulesProxy.CCSGameRules.m_iRoundTime": "round_time"})
     all_ticks = all_ticks[all_ticks["is_alive"] == True].sort_values("tick", kind="stable")  # noqa: E712
     all_ticks["steamid"] = all_ticks["steamid"].map(sid)
     # the analysis itself runs on every SAMPLE_EVERY-th tick of each round
@@ -394,6 +402,8 @@ def analyse(path, site_places):
         if rticks.empty:
             continue
         r_all = all_ticks[(all_ticks["tick"] >= ft) & (all_ticks["tick"] <= et)]
+        round_time = r_all["round_time"].dropna()
+        round_time = int(round_time.iloc[0]) if len(round_time) else ROUND_TIME
         team_of = dict(zip(rticks["steamid"], rticks["team_num"]))
         # what each player bought (equipment value once the buy is done)
         buy = rticks[rticks["tick"] <= ft + SETUP_END * TICKRATE].groupby("steamid")["current_equip_value"].max()
@@ -468,7 +478,8 @@ def analyse(path, site_places):
                             blinded=[[names.get(p, "?"), s] for p, s in u["blinded"] if p in alive_at(u["td"])])
                        for u in throws if ft <= u["t0"] <= view_hi and u["te"] >= view_lo]
             return {"round": rnd, "frames": frames, "events": events, "utility": utility,
-                    "weapons": weapons, "held": holding, "bomb": bomb, "round_start": ft, "plant_tick": plant_tick,
+                    "weapons": weapons, "held": holding, "bomb": bomb, "round_start": ft, "round_time": round_time,
+                    "plant_tick": plant_tick,
                     "bomb_end": list(bomb_end) if bomb_end else None}, pids
 
         for site, members in per_site.items():
@@ -696,7 +707,7 @@ def analyse(path, site_places):
                                     "local": True} for p in pids],
                           anchors=[e["id"] for e in engagements if e["round"] == rnd]))
 
-    viewer = {"map": map_name, "tickrate": TICKRATE, "local_radius": radius,
+    viewer = {"map": map_name, "tickrate": TICKRATE, "local_radius": radius, "bomb_time": bomb_time,
               "background": map_background(ticks, outline=not radar_files(map_name)), "reviews": reviews,
               "match": match}
     return map_name, pd.DataFrame(engagements), viewer
@@ -856,7 +867,21 @@ def write_results(map_name, eng, data, out=None, viewer_path=None, csv=None, dat
     return data
 
 
-DELETE_DEMOS = False  # --delete-demos: remove each .dem once its results are saved
+DELETE_DEMOS = False  # remove each .dem once its results are saved (--delete-demos, or the app's setting)
+SETTINGS = os.path.join(OUTPUT_DIR, "settings.json")
+
+
+def load_settings():
+    try:
+        with open(SETTINGS, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(**changes):
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    write_json(SETTINGS, {**load_settings(), **changes})
 
 
 def process_demo(path, site_places, player=None):
@@ -919,6 +944,37 @@ def pending_demos(force=False):
     return [os.path.join(DEMOS_DIR, f) for f in sorted(os.listdir(DEMOS_DIR))
             if f.lower().endswith(".dem")
             and (force or not os.path.exists(os.path.join(OUTPUT_DIR, os.path.splitext(f)[0], "meta.json")))]
+
+
+def check(site_places):
+    """Re-analyse every demo that has results and compare its engagements with them. Nothing is written.
+    Run it after changing the code: any difference means the ratings would change on reprocessing."""
+    demos = [p for p in (os.path.join(DEMOS_DIR, f) for f in sorted(os.listdir(DEMOS_DIR)) if f.lower().endswith(".dem"))
+             if os.path.isfile(os.path.join(OUTPUT_DIR, os.path.splitext(os.path.basename(p))[0], "engagements.csv"))
+             ] if os.path.isdir(DEMOS_DIR) else []
+    if not demos:
+        sys.exit("No demos with saved results to check (they need their .dem in demos/ and their output/ folder).")
+    changed = 0
+    for path in demos:
+        stem = os.path.splitext(os.path.basename(path))[0]
+        saved = pd.read_csv(os.path.join(OUTPUT_DIR, stem, "engagements.csv")).drop(columns="excluded", errors="ignore")
+        _, eng, _ = analyse(path, {k: set(v) for k, v in site_places.items()})
+        fresh = pd.read_csv(io.StringIO(eng.to_csv(index=False)))  # same dtypes as the saved CSV
+        if fresh.equals(saved):
+            print(f"same     {stem}")
+            continue
+        changed += 1
+        print(f"CHANGED  {stem}")
+        if len(fresh) != len(saved) or list(fresh.columns) != list(saved.columns):
+            print(f"         {len(saved)} -> {len(fresh)} engagements; columns {list(saved.columns)} -> {list(fresh.columns)}")
+            continue
+        diff = fresh.ne(saved) & ~(fresh.isna() & saved.isna())
+        for i in np.flatnonzero(diff.any(axis=1))[:5]:
+            cols = diff.columns[diff.iloc[i]]
+            print(f"         round {saved.at[i, 'round']} {saved.at[i, 'player']}: "
+                  + ", ".join(f"{c} {saved.at[i, c]} -> {fresh.at[i, c]}" for c in cols))
+    print(f"\n{len(demos) - changed} of {len(demos)} demos unchanged.")
+    sys.exit(1 if changed else 0)
 
 
 def batch(args, site_places):
@@ -1027,6 +1083,8 @@ class App(BaseHTTPRequestHandler):
             return self.reply(200, list_demos())
         if path == "/api/jobs":
             return self.reply(200, list(JOBS.values()))
+        if path == "/api/settings":
+            return self.reply(200, {"delete_demos": DELETE_DEMOS})
         if path.startswith("/maps/"):
             file = os.path.join(MAPS_DIR, os.path.basename(path))
             ctype = RADAR_TYPES.get(os.path.splitext(file)[1])
@@ -1044,12 +1102,22 @@ class App(BaseHTTPRequestHandler):
                     with open(match, "rb") as f:
                         return self.reply(200, f.read())
             if data is not None and action == "export":  # standalone copy that works offline
-                return self.reply(200, viewer_html(data, load_match(name)), "text/html; charset=utf-8",
+                full = parse_qs(urlparse(self.path).query).get("match") == ["1"]
+                return self.reply(200, viewer_html(data, load_match(name) if full else None), "text/html; charset=utf-8",
                                   [("Content-Disposition", f'attachment; filename="{name}.html"')])
         self.reply(404, {"error": "Not found."})
 
     def do_POST(self):
+        global DELETE_DEMOS
         url = urlparse(self.path)
+        if url.path == "/api/settings":
+            try:
+                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+                DELETE_DEMOS = bool(body["delete_demos"])
+            except (ValueError, KeyError, TypeError):
+                return self.reply(400, {"error": "Bad request."})
+            save_settings(delete_demos=DELETE_DEMOS)
+            return self.reply(200, {"delete_demos": DELETE_DEMOS})
         m = re.fullmatch(r"/api/demos/([^/]+)/exclude", unquote(url.path))
         if m:
             try:
@@ -1119,6 +1187,8 @@ def main():
     ap.add_argument("--batch", action="store_true",
                     help="process every new demo in the demos/ folder without opening the viewer")
     ap.add_argument("--force", action="store_true", help="--batch: also redo demos that already have output")
+    ap.add_argument("--check", action="store_true",
+                    help="re-analyse demos that have results and report any engagement that would change")
     ap.add_argument("--port", type=int, default=8765, help="viewer app port (default 8765)")
     ap.add_argument("--no-browser", action="store_true", help="start the viewer app without opening a browser")
     ap.add_argument("--player", help="only show this player (name substring)")
@@ -1131,7 +1201,7 @@ def main():
                     help='treat extra nav place names as a site, e.g. "BombsiteB:Bench,Market"')
     args = ap.parse_args()
     global DELETE_DEMOS
-    DELETE_DEMOS = args.delete_demos
+    DELETE_DEMOS = args.delete_demos or bool(load_settings().get("delete_demos"))
 
     site_places = {k: set(v) for k, v in SITE_PLACES.items()}
     for spec in args.extra_places:
@@ -1144,6 +1214,8 @@ def main():
             run(args.demo, site_places, args.player, args.out, args.viewer, args.csv)
         except ValueError as e:
             sys.exit(str(e))
+    elif args.check:
+        check(site_places)
     elif args.batch:
         batch(args, site_places)
     else:

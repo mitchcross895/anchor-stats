@@ -41,9 +41,10 @@ python anchor-stats.py match.dem --viewer review.html --out ratings.txt --csv fi
 python anchor-stats.py match.dem --player "Paladin"
 python anchor-stats.py --extra-places "B:Bench,Market"   # count extra nav places as a site
 python anchor-stats.py --delete-demos           # delete each .dem once it's processed, to save space
+python anchor-stats.py --check                  # after editing the code: would any rating change?
 ```
 
-Demos are big (200-400 MB each) and the results are tiny, so `--delete-demos` (for example `run.bat --delete-demos`) deletes each `.dem` once its results are saved. You can't reprocess a deleted demo, for example after changing a setting, unless you upload it again.
+Demos are big (200-400 MB each) and the results are tiny, so you can have each `.dem` deleted once its results are saved: tick **Delete each .dem after processing** in the app (it's remembered), or start it with `run.bat --delete-demos`. You can't reprocess a deleted demo, for example after changing a setting, unless you upload it again.
 
 The viewer app only listens on this computer (`127.0.0.1`), so nobody else on your network can reach it.
 
@@ -57,7 +58,7 @@ Each player shows:
 - a white dot while they're flashed
 - a small red tag if they're carrying the bomb (a dropped bomb shows where it fell)
 
-The clock in the top left shows the round time, and the bomb timer once it's planted. Players and markers keep their size relative to the map as you zoom.
+The clock in the top left shows the round time, and the bomb timer once it's planted. Both come from the demo: the round length the server used, and the bomb fuse measured from bombs that exploded. Players and markers keep their size relative to the map as you zoom.
 
 Utility is shown too:
 - **Grenades in flight** leave a trail in the thrower's team colour.
@@ -71,7 +72,9 @@ To leave a fight out of the ratings (a misread anchor, a bugged round, ...), sel
 
 To watch the whole demo, click **Full match** above the list. Every round is listed with its winner, kills and bomb result; pick one to watch it, and playback runs on from round to round. The right-hand panel lists that round's kills and utility, and links to any anchor fights in it. **Anchor fights** takes you back.
 
-To share a review, open it and click **Download offline copy**. That gives you a single `.html` file that works without the app, radar included.
+To share a review, open it and click **Download offline copy**. That gives you a single `.html` file that works without the app, radar included. Tick **include full match** first if you want the copy to play every round too (about 4 MB instead of 1 MB).
+
+`--check` re-analyses every demo that has results and compares the fights with what's saved, without writing anything. Run it after changing the code or a setting to see exactly which fights would change. It exits with an error if any would.
 
 ## How the rating works
 
